@@ -1,4 +1,4 @@
-#![feature(box_syntax)]
+#![feature(box_syntax, core_intrinsics)]
 #![allow(non_snake_case)]
 
 use rand::prelude::*;
@@ -9,12 +9,12 @@ pub struct Context<const DIMS: usize> {
     /// Number of nodes
     pub n: usize,
     /// Gradient vector
-    pub g: [Vec<f32>; DIMS],
+    pub g: Vec<f32>,
     /// Hessian matrix
-    pub H: [Vec<Vec<f32>>; DIMS],
+    pub H: Vec<f32>,
     /// matrix of desired distances between pairs of nodes
-    pub D: Vec<Vec<f32>>,
-    pub G: Option<Vec<Vec<f32>>>,
+    pub D: Vec<f32>,
+    pub G: Option<Vec<f32>>,
     rng: Pcg32,
     min_d: f32,
     // snap_grid_size: f32,
@@ -25,25 +25,25 @@ pub struct Context<const DIMS: usize> {
 }
 
 impl<const DIMS: usize> Context<DIMS> {
-    pub fn new(D: Vec<Vec<f32>>, G: Option<Vec<Vec<f32>>>, node_count: usize) -> Self {
-        let mut g: [Vec<f32>; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        let mut H: [Vec<Vec<f32>>; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+    pub fn new(D: Vec<f32>, G: Option<Vec<f32>>, node_count: usize) -> Self {
+        let mut g: Vec<f32> = Vec::with_capacity(DIMS * node_count);
+        let mut H: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
+        unsafe {
+            H.set_len(DIMS * node_count * node_count);
+            g.set_len(DIMS * node_count);
+        };
         let mut Hd: [Vec<f32>; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
 
         for i in 0..DIMS {
             unsafe {
-                g.as_mut_ptr().add(i).write(vec![0.; node_count]);
                 Hd.as_mut_ptr().add(i).write(vec![0.; node_count]);
-                H.as_mut_ptr()
-                    .add(i)
-                    .write(vec![vec![0.; node_count]; node_count]);
             }
         }
 
         let mut min_d = D
             .iter()
-            .flat_map(|d| d.iter().copied())
-            .filter(|x| !x.is_nan() && !x.is_infinite() && *x > 0.)
+            .copied()
+            .filter(|&x| !x.is_nan() && !x.is_infinite() && x > 0.)
             .min_by(|a, b| a.partial_cmp(b).unwrap())
             .unwrap_or(f32::MAX);
         if min_d == f32::MAX {
@@ -80,7 +80,29 @@ impl<const DIMS: usize> Context<DIMS> {
         u
     }
 
-    pub fn compute(&mut self, x: &mut [&mut [f32]; DIMS]) {
+    fn get_H_mut(&mut self, i: usize, u: usize, v: usize) -> &mut f32 {
+        let n = self.n;
+        let dim_size = self.n * n;
+        if cfg!(debug_assertions) {
+            &mut self.H[dim_size * i + (u * n) + v]
+        } else {
+            unsafe { self.H.get_unchecked_mut(dim_size * i + (u * n) + v) }
+        }
+    }
+
+    fn set_H(&mut self, i: usize, u: usize, v: usize, val: f32) {
+        let n = self.n;
+        let dim_size = self.n * n;
+        if cfg!(debug_assertions) {
+            self.H[dim_size * i + (u * n) + v] = val;
+        } else {
+            unsafe {
+                *self.H.get_unchecked_mut(dim_size * i + (u * n) + v) = val;
+            }
+        }
+    }
+
+    pub fn compute(&mut self, x: &mut [f32]) {
         // distance vector
         let mut d: [f32; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         // distance vector squared
@@ -88,6 +110,7 @@ impl<const DIMS: usize> Context<DIMS> {
         // Hessian diagonal
         let mut Huu: [f32; DIMS] = [0.; DIMS];
         let mut max_h: f32 = 0.;
+        let n = self.n;
 
         // across all nodes u
         for u in 0..self.n {
@@ -95,11 +118,11 @@ impl<const DIMS: usize> Context<DIMS> {
             for i in 0..DIMS {
                 if cfg!(debug_assertions) {
                     Huu[i] = 0.;
-                    self.g[i][u] = 0.;
+                    self.g[i * n + u] = 0.;
                 } else {
                     unsafe {
                         *Huu.get_unchecked_mut(i) = 0.;
-                        *self.g.get_unchecked_mut(i).get_unchecked_mut(u) = 0.;
+                        *self.g.get_unchecked_mut(i * n + u) = 0.;
                     }
                 }
             }
@@ -118,49 +141,36 @@ impl<const DIMS: usize> Context<DIMS> {
                     distance_squared = 0.;
                     for i in 0..DIMS {
                         let dx = if cfg!(debug_assertions) {
-                            x[i][u] - x[i][v]
+                            x[i * n + u] - x[i * n + v]
                         } else {
-                            unsafe {
-                                *x.get_unchecked(i).get_unchecked(u)
-                                    - *x.get_unchecked(i).get_unchecked(v)
-                            }
+                            unsafe { *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v) }
                         };
                         let dx2 = dx * dx;
-
-                        if cfg!(debug_assertions) {
-                            d[i] = dx;
-                            d2[i] = dx2;
-                        } else {
-                            unsafe {
-                                *d.get_unchecked_mut(i) = dx;
-                                *d2.get_unchecked_mut(i) = dx2;
-                            }
-                        }
-
+                        d[i] = dx;
+                        d2[i] = dx2;
                         distance_squared += dx2;
                     }
 
-                    if distance_squared > 0.000000001 {
+                    if std::intrinsics::likely(distance_squared > 0.000000001) {
                         break;
                     }
                     let rd = self.offset_dir();
 
                     for i in 0..DIMS {
                         if cfg!(debug_assertions) {
-                            x[i][v] += rd[i];
+                            x[i * n + v] += rd[i];
                         } else {
                             unsafe {
-                                *x.get_unchecked_mut(i).get_unchecked_mut(v) +=
-                                    *rd.get_unchecked(i);
+                                *x.get_unchecked_mut(i * n + v) += *rd.get_unchecked(i);
                             }
                         }
                     }
                 }
                 let distance = distance_squared.sqrt();
                 let ideal_distance = if cfg!(debug_assertions) {
-                    self.D[u][v]
+                    self.D[u * n + v]
                 } else {
-                    unsafe { *self.D.get_unchecked(u).get_unchecked(v) }
+                    unsafe { *self.D.get_unchecked(u * n + v) }
                 };
                 // if ideal_distance == 0. {
                 //     panic!("ideal_distance=0; self.D={:?}", self.D);
@@ -171,9 +181,9 @@ impl<const DIMS: usize> Context<DIMS> {
                 let mut weight = match self.G.as_ref() {
                     Some(G) => {
                         if cfg!(debug_assertions) {
-                            G[u][v]
+                            G[u * n + v]
                         } else {
-                            unsafe { *G.get_unchecked(u).get_unchecked(v) }
+                            unsafe { *G.get_unchecked(u * n + v) }
                         }
                     }
                     None => 1.,
@@ -182,17 +192,7 @@ impl<const DIMS: usize> Context<DIMS> {
                 // ignore long range attractions for nodes not immediately connected (P-stress)
                 if weight > 1. && distance > ideal_distance || !ideal_distance.is_finite() {
                     for i in 0..DIMS {
-                        if cfg!(debug_assertions) {
-                            self.H[i][u][v] = 0.;
-                        } else {
-                            unsafe {
-                                *self
-                                    .H
-                                    .get_unchecked_mut(i)
-                                    .get_unchecked_mut(u)
-                                    .get_unchecked_mut(v) = 0.
-                            }
-                        }
+                        self.set_H(i, u, v, 0.);
                     }
                     continue;
                 }
@@ -208,8 +208,8 @@ impl<const DIMS: usize> Context<DIMS> {
                     2. * weight * (distance - ideal_distance) / (ideal_distance_squared * distance);
                 let distance_cubed = distance_squared * distance;
                 let hs = 2. * -weight / (ideal_distance_squared * distance_cubed);
-                if !gs.is_finite() {
-                    if cfg!(debug_assertions) {
+                if cfg!(debug_assertions) {
+                    if !gs.is_finite() {
                         if !weight.is_finite() {
                             panic!("bad weight: {}", weight);
                         } else if !distance.is_finite() {
@@ -217,20 +217,21 @@ impl<const DIMS: usize> Context<DIMS> {
                         } else if !ideal_distance.is_finite() {
                             panic!();
                         }
+
+                        panic!();
                     }
-                    panic!();
                 }
 
                 for i in 0..DIMS {
-                    self.g[i][u] += d[i] * gs;
+                    self.g[i * n + u] += d[i] * gs;
                     let idk =
                         hs * (2. * distance_cubed + ideal_distance * (d2[i] - distance_squared));
-                    self.H[i][u][v] = idk;
+                    self.set_H(i, u, v, idk);
                     Huu[i] -= idk;
                 }
             }
             for i in 0..DIMS {
-                self.H[i][u][u] = Huu[i];
+                self.set_H(i, u, u, Huu[i]);
                 max_h = max_h.max(Huu[i]);
             }
         }
@@ -242,19 +243,14 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     pub fn apply_lock(&mut self, u: usize, p: [f32; DIMS], x_i_u: [f32; DIMS]) {
+        let n = self.n;
         for i in 0..DIMS {
+            *self.get_H_mut(i, u, u) += self.max_h;
             if cfg!(debug_assertions) {
-                self.H[i][u][u] += self.max_h;
-                self.g[i][u] -= self.max_h * (p[i] - x_i_u[i]);
+                self.g[i * n + u] -= self.max_h * (p[i] - x_i_u[i]);
             } else {
                 unsafe {
-                    *self
-                        .H
-                        .get_unchecked_mut(i)
-                        .get_unchecked_mut(u)
-                        .get_unchecked_mut(u) += self.max_h;
-                    *self.g.get_unchecked_mut(i).get_unchecked_mut(u) -=
-                        self.max_h * (p[i] - x_i_u[i]);
+                    *self.g.get_unchecked_mut(i * n + u) -= self.max_h * (p[i] - x_i_u[i]);
                 }
             }
         }
@@ -270,17 +266,12 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     /// result r = matrix m * vector v
-    fn right_multiply(m: &[Vec<f32>], v: &[f32], r: &mut [f32]) {
-        for i in 0..m.len() {
-            let a = if cfg!(debug_assertions) {
-                &m[i]
-            } else {
-                unsafe { m.get_unchecked(i) }
-            };
+    fn right_multiply<'a>(m: impl Iterator<Item = &'a [f32]>, v: &[f32], r: &mut [f32]) {
+        for (i, mn) in m.enumerate() {
             if cfg!(debug_assertions) {
-                r[i] = Self::dot_prod(a, v);
+                r[i] = Self::dot_prod(mn, v);
             } else {
-                unsafe { *r.get_unchecked_mut(i) = Self::dot_prod(a, v) };
+                unsafe { *r.get_unchecked_mut(i) = Self::dot_prod(mn, v) };
             }
         }
     }
@@ -292,12 +283,17 @@ impl<const DIMS: usize> Context<DIMS> {
     pub fn compute_step_size(&mut self) -> f32 {
         let mut numerator = 0.;
         let mut denominator = 0.;
-        let d = &self.g;
+        let H_dim_size = self.n * self.n;
+        let n = self.n;
 
-        for i in 0..DIMS {
-            numerator += Self::dot_prod(&self.g[i], &d[i]);
-            Self::right_multiply(&self.H[i], &d[i], &mut self.Hd[i]);
-            denominator += Self::dot_prod(&d[i], &self.Hd[i]);
+        for (i, gn) in self.g.chunks_exact(n).enumerate() {
+            numerator += Self::dot_prod(gn, gn);
+            Self::right_multiply(
+                self.H[(i * H_dim_size)..(i * H_dim_size + H_dim_size)].chunks_exact(n),
+                gn,
+                &mut self.Hd[i],
+            );
+            denominator += Self::dot_prod(gn, &self.Hd[i]);
         }
 
         if denominator == 0. || !denominator.is_finite() {
@@ -324,16 +320,8 @@ pub fn create_derivative_computer_ctx(
             assert_eq!(G.len(), node_count * node_count);
         }
 
-        let ctx: Context<2> = Context::new(
-            D.chunks_exact(node_count).map(Into::into).collect(),
-            if G.is_empty() {
-                None
-            } else {
-                let G = G.chunks_exact(node_count).map(Into::into).collect();
-                Some(G)
-            },
-            node_count,
-        );
+        let ctx: Context<2> =
+            Context::new(D, if G.is_empty() { None } else { Some(G) }, node_count);
         Box::into_raw(box ctx) as _
     } else if dimensions == 3 {
         assert_eq!(D.len(), node_count * node_count);
@@ -341,57 +329,26 @@ pub fn create_derivative_computer_ctx(
             assert_eq!(G.len(), node_count * node_count);
         }
 
-        let ctx: Context<3> = Context::new(
-            D.chunks_exact(node_count).map(Into::into).collect(),
-            if G.is_empty() {
-                None
-            } else {
-                let G = G.chunks_exact(node_count).map(Into::into).collect();
-                Some(G)
-            },
-            node_count,
-        );
+        let ctx: Context<3> =
+            Context::new(D, if G.is_empty() { None } else { Some(G) }, node_count);
         Box::into_raw(box ctx) as _
     } else {
         unimplemented!();
     }
 }
 
-fn unpack_x<'a>(x: &'a mut [f32], n: usize) -> impl Iterator<Item = &'a mut [f32]> {
-    x.chunks_exact_mut(n)
-}
-
-fn pack_x(unpacked_x: &[&mut [f32]]) -> Vec<f32> {
-    let mut out = Vec::new();
-    for xn in unpacked_x {
-        for &x in xn.iter() {
-            out.push(x);
-        }
-    }
-    out
-}
-
 #[wasm_bindgen]
 pub fn compute_2d(ctx_ptr: *mut Context<2>, mut x: Vec<f32>) -> Vec<f32> {
     let ctx: &mut Context<2> = unsafe { &mut *ctx_ptr };
-    let mut unpacked_x = unpack_x(&mut x, ctx.n);
-    let unpacked_x_0 = unpacked_x.next().unwrap();
-    let unpacked_x_1 = unpacked_x.next().unwrap();
-    let ctx: &mut Context<2> = unsafe { &mut *ctx_ptr };
-    ctx.compute(&mut [unpacked_x_0, unpacked_x_1]);
-    pack_x(&[unpacked_x_0, unpacked_x_1])
+    ctx.compute(&mut x);
+    x
 }
 
 #[wasm_bindgen]
 pub fn compute_3d(ctx_ptr: *mut Context<3>, mut x: Vec<f32>) -> Vec<f32> {
     let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
-    let mut unpacked_x = unpack_x(&mut x, ctx.n);
-    let unpacked_x_0 = unpacked_x.next().unwrap();
-    let unpacked_x_1 = unpacked_x.next().unwrap();
-    let unpacked_x_2 = unpacked_x.next().unwrap();
-    let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
-    ctx.compute(&mut [unpacked_x_0, unpacked_x_1, unpacked_x_2]);
-    pack_x(&[unpacked_x_0, unpacked_x_1, unpacked_x_2])
+    ctx.compute(&mut x);
+    x
 }
 
 #[wasm_bindgen]
@@ -443,69 +400,37 @@ pub fn get_memory() -> JsValue {
 
 // D Getters
 #[wasm_bindgen]
-pub fn get_D_2d(ctx: *mut Context<2>) -> Vec<usize> {
+pub fn get_D_2d(ctx: *mut Context<2>) -> *mut f32 {
     let ctx = unsafe { &mut *ctx };
-    let dn = &mut ctx.D;
-    dn.iter_mut().map(|dnn| dnn.as_mut_ptr() as usize).collect()
+    ctx.D.as_mut_ptr()
 }
 
 #[wasm_bindgen]
-pub fn get_D_3d(ctx: *mut Context<3>) -> Vec<usize> {
+pub fn get_D_3d(ctx: *mut Context<3>) -> *mut f32 {
     let ctx = unsafe { &mut *ctx };
-    let dn = &mut ctx.D;
-    dn.iter_mut().map(|dnn| dnn.as_mut_ptr() as usize).collect()
+    ctx.D.as_mut_ptr()
 }
 
 // g Getters
 #[wasm_bindgen]
-pub fn get_g_2d_0(ctx: *mut Context<2>) -> *mut f32 {
-    unsafe { (*ctx).g[0].as_mut_ptr() }
+pub fn get_g_2d(ctx: *mut Context<2>) -> *mut f32 {
+    unsafe { (*ctx).g.as_mut_ptr() }
 }
 
 #[wasm_bindgen]
-pub fn get_g_2d_1(ctx: *mut Context<2>) -> *mut f32 {
-    unsafe { (*ctx).g[1].as_mut_ptr() }
+pub fn get_g_3d(ctx: *mut Context<3>) -> *mut f32 {
+    unsafe { (*ctx).g.as_mut_ptr() }
 }
 
 #[wasm_bindgen]
-pub fn get_g_3d_0(ctx: *mut Context<3>) -> *mut f32 {
-    unsafe { (*ctx).g[0].as_mut_ptr() }
-}
-
-#[wasm_bindgen]
-pub fn get_g_3d_1(ctx: *mut Context<3>) -> *mut f32 {
-    unsafe { (*ctx).g[1].as_mut_ptr() }
-}
-
-#[wasm_bindgen]
-pub fn get_g_3d_2(ctx: *mut Context<3>) -> *mut f32 {
-    unsafe { (*ctx).g[2].as_mut_ptr() }
-}
-
-#[wasm_bindgen]
-pub fn set_g_2d(ctx: *mut Context<2>, new_g: Vec<f32>) {
+pub fn set_G_2d(ctx: *mut Context<2>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
-    debug_assert_eq!(new_g.len(), ctx.n * ctx.n);
-    ctx.G = Some(new_g.chunks_exact(ctx.n).map(Into::into).collect());
+    assert_eq!(new_G.len(), ctx.n * ctx.n);
+    ctx.G = Some(new_G);
 }
 
 #[wasm_bindgen]
-pub fn set_g_3d(ctx: *mut Context<3>, new_g: Vec<f32>) {
+pub fn set_G_3d(ctx: *mut Context<3>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
-    ctx.G = Some(new_g.chunks_exact(ctx.n).map(Into::into).collect());
-}
-
-// H Getters
-#[wasm_bindgen]
-pub fn get_H_2d(ctx: *mut Context<2>, i: usize) -> Vec<usize> {
-    let ctx = unsafe { &mut *ctx };
-    let hn = &mut ctx.H[i];
-    hn.iter_mut().map(|hnn| hnn.as_mut_ptr() as usize).collect()
-}
-
-#[wasm_bindgen]
-pub fn get_H_3d(ctx: *mut Context<3>, i: usize) -> Vec<usize> {
-    let ctx = unsafe { &mut *ctx };
-    let hn = &mut ctx.H[i];
-    hn.iter_mut().map(|hnn| hnn.as_mut_ptr() as usize).collect()
+    ctx.G = Some(new_G);
 }

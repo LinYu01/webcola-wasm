@@ -58,27 +58,6 @@ DEBUG */
         private ctxPtr: number;
 
         public threshold: number = 0.0001;
-        /**
-         * Hessian Matrix
-         */
-        public H(i: number): Float32Array[] {
-            const memory: WebAssembly.Memory = this.wasm.get_memory();
-            const memoryView = new Float32Array(memory.buffer);
-
-            let hPtrs: Uint32Array;
-            if (this.k === 2) {
-                hPtrs = this.wasm.get_H_2d(this.ctxPtr, i);
-            } else if (this.k === 3) {
-                hPtrs = this.wasm.get_H_3d(this.ctxPtr, i);
-            } else {
-                throw new Error('Invalid dimensionality');
-            }
-
-            return Array.from(hPtrs).map(hPtr => {
-                const offset = hPtr / BYTES_PER_F32;
-                return memoryView.subarray(offset,offset + this.n);
-            });
-        }
         /** gradient vector
          * @property g {Float32Array[]}
          */
@@ -86,31 +65,20 @@ DEBUG */
             const memory: WebAssembly.Memory = this.wasm.get_memory();
             const memoryView = new Float32Array(memory.buffer);
 
-            if (this.k === 2) {
-                const offset0 = this.wasm.get_g_2d_0(this.ctxPtr) / BYTES_PER_F32;
-                const offset1 = this.wasm.get_g_2d_1(this.ctxPtr) / BYTES_PER_F32;
-                return [memoryView.subarray(offset0, offset0 + this.n), memoryView.subarray(offset1, offset1 + this.n)];
-            } else if (this.k === 3) {
-                const offset0 = this.wasm.get_g_3d_0(this.ctxPtr) / BYTES_PER_F32;
-                const offset1 = this.wasm.get_g_3d_1(this.ctxPtr) / BYTES_PER_F32;
-                const offset2 = this.wasm.get_g_3d_2(this.ctxPtr) / BYTES_PER_F32;
-                return [
-                    memoryView.subarray(offset0, offset0 + this.n),
-                    memoryView.subarray(offset1, offset1 + this.n),
-                    memoryView.subarray(offset2, offset2 + this.n)
-                ];
-            } else {
-                throw new Error('Invalid dimensionality');
-            }
+            const gPtr = this.k === 2 ? this.wasm.get_g_2d(this.ctxPtr) : this.wasm.get_g_3d(this.ctxPtr);
+            const gOffset = gPtr / BYTES_PER_F32;
+            return new Array(this.k)
+                .fill(null)
+                .map((_, i) => memoryView.subarray(gOffset + i * this.n, gOffset + i * this.n + this.n));
         }
         public set G(newG: Float32Array[])  {
             const allG = new Float32Array(this.n * this.n);
             newG.forEach((Gn, i) => allG.set(Gn, i * this.n));
 
             if (this.k === 2) {
-                this.wasm.set_g_2d(this.ctxPtr, allG);
+                this.wasm.set_G_2d(this.ctxPtr, allG);
             } else if (this.k === 3) {
-                this.wasm.set_g_3d(this.ctxPtr, allG);
+                this.wasm.set_G_3d(this.ctxPtr, allG);
             } else {
                 throw new Error('Invalid dimensionality');
             }
@@ -135,19 +103,11 @@ DEBUG */
             const memory: WebAssembly.Memory = this.wasm.get_memory();
             const memoryView = new Float32Array(memory.buffer);
 
-            let gPtrs: Uint32Array;
-            if (this.k === 2) {
-                gPtrs = this.wasm.get_D_2d(this.ctxPtr, );
-            } else if (this.k === 3) {
-                gPtrs = this.wasm.get_D_3d(this.ctxPtr, );
-            } else {
-                throw new Error('Invalid dimensionality');
-            }
-
-            return Array.from(gPtrs).map(gPtr => {
-                const offset = gPtr / BYTES_PER_F32;
-                return memoryView.subarray(offset,offset + this.n);
-            });
+            const DPtr = this.k === 2 ? this.wasm.get_D_2d(this.ctxPtr) : this.wasm.get_d_3d(this.ctxPtr);
+            const DOffset = DPtr / BYTES_PER_F32;
+            return new Array(this.n)
+                .fill(null)
+                .map((_, i) => memoryView.subarray(DOffset + i * this.n, DOffset + i * this.n + this.n));
         }
 
         public computeDerivatives(x: Float32Array[]) {
