@@ -115,30 +115,10 @@ DEBUG */
                 throw new Error('Invalid dimensionality');
             }
         }
-        /** positions vector
-         * @property x {Float32Array[]}
+       /** positions vector
+         * @property x {number[][]}
          */
-         public get x(): Float32Array[] {
-            const memory: WebAssembly.Memory = this.wasm.get_memory();
-            const memoryView = new Float32Array(memory.buffer);
-
-            if (this.k === 2) {
-                const offset0 = this.wasm.get_x_2d_0(this.ctxPtr) / BYTES_PER_F32;
-                const offset1 = this.wasm.get_x_2d_1(this.ctxPtr) / BYTES_PER_F32;
-                return [memoryView.subarray(offset0, offset0 + this.n), memoryView.subarray(offset1, offset1 + this.n)];
-            } else if (this.k === 3) {
-                const offset0 = this.wasm.get_x_3d_0(this.ctxPtr) / BYTES_PER_F32;
-                const offset1 = this.wasm.get_x_3d_1(this.ctxPtr) / BYTES_PER_F32;
-                const offset2 = this.wasm.get_x_3d_2(this.ctxPtr) / BYTES_PER_F32;
-                return [
-                    memoryView.subarray(offset0, offset0 + this.n),
-                    memoryView.subarray(offset1, offset1 + this.n),
-                    memoryView.subarray(offset2, offset2 + this.n)
-                ];
-            } else {
-                throw new Error('Invalid dimensionality');
-            }
-        }
+        public x: Float32Array[];
         /**
          * @property k {number} dimensionality
          */
@@ -170,13 +150,13 @@ DEBUG */
             });
         }
 
-        public computeDerivatives(x: Float32Array[] | null) {
+        public computeDerivatives(x: Float32Array[]) {
             if (this.k === 2) {
-                const packedX = x ? (() => {
+                const packedX = (() => {
                     const packed = new Float32Array(x[0].length * this.k);
                     x.forEach((xn, i) => packed.set(xn, i * this.n));
                     return packed;
-                })() : new Float32Array(0);
+                })();
                 const outX = this.wasm.compute_2d(this.ctxPtr, packedX);
 
                 if (x) {
@@ -186,11 +166,11 @@ DEBUG */
                     })
                 }
             } else if (this.k === 3) {
-                const packedX = x ? (() => {
+                const packedX = (() => {
                     const packed = new Float32Array(x[0].length * this.k);
                     x.forEach((xn, i) => packed.set(xn, i * this.n));
                     return packed;
-                })() : new Float32Array(0);
+                })();
                 const outX = this.wasm.compute_3d(this.ctxPtr, packedX);
 
                 if (x) {
@@ -202,6 +182,18 @@ DEBUG */
             } else {
                 throw new Error('Invalid dimensionality');
             }
+
+            if (!this.locks.isEmpty()) {
+                this.locks.apply((u, p) => {
+                    if (this.k === 2) {
+                        this.wasm.apply_lock_2d(this.ctxPtr, u, p[0], p[1], x[0][u], x[1][u]);
+                    } else if (this.k === 3) {
+                        this.wasm.apply_lock_3d(this.ctxPtr, u, p[0], p[1], p[2], x[0][u], x[1][u], x[2][u]);
+                    } else {
+                        throw new Error('Invalid dimensionality');
+                    }
+                });
+            }
         }
 
         public locks: Locks;
@@ -210,7 +202,6 @@ DEBUG */
         private minD: number;
 
         // pool of arrays of size n used internally, allocated in constructor
-        private Hd: Float32Array[];
         private a: Float32Array[];
         private b: Float32Array[];
         private c: Float32Array[];
@@ -233,15 +224,11 @@ DEBUG */
 
         public project: { (x0: Float32Array, y0: Float32Array, r: Float32Array): void }[] = null;
 
-        private setupWasm(wasm: /* typeof import('./wasm/wasm') */ any, x: number[][], D: number[][], G: number[][] | null = null) {
+        private setupWasm(wasm: /* typeof import('./wasm/wasm') */ any, D: number[][], G: number[][] | null = null) {
             this.wasm = wasm;
             // Concat all x into a single vector
-            const allX = new Float32Array(this.n * this.k);
             const allD = new Float32Array(this.n * this.n);
             const allG = G ? new Float32Array(this.n * this.k) : new Float32Array(0);
-            x.forEach((xn, i) => {
-                allX.set(xn, i * this.n);
-            });
             D.forEach((dn, i) => {
                 allD.set(dn, i * this.n);
             });
@@ -250,7 +237,7 @@ DEBUG */
                     allG.set(gn, i * this.n);
                 });
             }
-            this.ctxPtr = this.wasm.create_derivative_computer_ctx(this.k, this.n, allX, allD, allG);
+            this.ctxPtr = this.wasm.create_derivative_computer_ctx(this.k, this.n, allD, allG);
         }
 
         /**
@@ -262,13 +249,13 @@ DEBUG */
          * If G[i][j] <= 1 then it is used as a weighting on the contribution of the variance between ideal and actual separation between i and j to the goal function
          */
         constructor(x: number[][], D: number[][], G: number[][] = null, wasm: /* typeof import('./wasm/wasm') */ any) {
+            this.x = x.map(xn => new Float32Array(xn));
             this.k = x.length; // dimensionality
             var n = this.n = x[0].length; // number of nodes
 
             // Set up Wasm context
-            this.setupWasm(wasm, x, D, G);
+            this.setupWasm(wasm, D, G);
 
-            this.Hd = new Array(this.k);
             this.a = new Array(this.k);
             this.b = new Array(this.k);
             this.c = new Array(this.k);
@@ -293,7 +280,6 @@ DEBUG */
             i = this.k;
             while (i--) {
                 j = n;
-                this.Hd[i] = new Float32Array(n);
                 this.a[i] = new Float32Array(n);
                 this.b[i] = new Float32Array(n);
                 this.c[i] = new Float32Array(n);
@@ -342,22 +328,22 @@ DEBUG */
         // computes the optimal step size to take in direction d using the
         // derivative information in this.g and this.H
         // returns the scalar multiplier to apply to d to get the optimal step
-        public computeStepSize(d: Float32Array[]): number {
-            var numerator = 0, denominator = 0;
-            for (var i = 0; i < this.k; ++i) {
-                numerator += Descent.dotProd(this.g[i], d[i]);
-                Descent.rightMultiply(this.H(i), d[i], this.Hd[i]);
-                denominator += Descent.dotProd(d[i], this.Hd[i]);
+        public computeStepSize(): number {
+            if (this.k === 2) {
+                return this.wasm.compute_step_size_2d(this.ctxPtr);
+            } else if (this.k === 3) {
+                return this.wasm.compute_step_size_3d(this.ctxPtr);
+            } else {
+                throw new Error('Invalid dimensionality');
             }
-            if (denominator === 0 || !isFinite(denominator)) return 0;
-            return 1 * numerator / denominator;
         }
 
         public reduceStress(): number {
-            this.computeDerivatives(null);
-            var alpha = this.computeStepSize(this.g);
+            this.computeDerivatives(this.x);
+            var alpha = this.computeStepSize();
+            const thisG = this.g;
             for (var i = 0; i < this.k; ++i) {
-                this.takeDescentStep(this.x[i], this.g[i], alpha);
+                this.takeDescentStep(this.x[i], thisG[i], alpha);
             }
             return this.computeStress();
         }
@@ -408,9 +394,8 @@ DEBUG */
         }
 
         private computeNextPosition(x0: Float32Array[], r: Float32Array[]): void {
-            // TODO TODO TODO
             this.computeDerivatives(x0);
-            var alpha = this.computeStepSize(this.g);
+            const alpha = this.computeStepSize();
             this.stepAndProject(x0, r, this.g, alpha);
 /* DEBUG
             for (var u: number = 0; u < this.n; ++u)
@@ -418,10 +403,12 @@ DEBUG */
                     if (isNaN(r[i][u])) debugger;
 DEBUG */
             if (this.project) {
-                this.matrixApply((i, j) => this.e[i][j] = x0[i][j] - r[i][j]);
-                var beta = this.computeStepSize(this.e);
-                beta = Math.max(0.2, Math.min(beta, 1));
-                this.stepAndProject(x0, r, this.e, beta);
+                // This functionality is not yet implemented with the Wasm port
+                throw new Error('Computing step with with `this.project` set is not yet implemented in Wasm port');
+                // this.matrixApply((i, j) => this.e[i][j] = x0[i][j] - r[i][j]);
+                // var beta = this.computeStepSize(this.e);
+                // beta = Math.max(0.2, Math.min(beta, 1));
+                // this.stepAndProject(x0, r, this.e, beta);
             }
         }
 
