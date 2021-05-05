@@ -493,17 +493,17 @@ import {separateGraphs, applyPacking} from './handledisconnected'
          * @param {number} [initialUserConstraintIterations=0] initial layout iterations with user-specified constraints
          * @param {number} [initialAllConstraintsIterations=0] initial layout iterations with all constraints including non-overlap
          * @param {number} [gridSnapIterations=0] iterations of "grid snap", which pulls nodes towards grid cell centers - grid of size node[0].width - only really makes sense if all nodes have the same width and height
-         * @param [keepRunning=true] keep iterating asynchronously via the tick method
+         * @param [keepRunning=true] keep iterating shronously via the tick method
          * @param [centerGraph=true] Center graph on restart
          */
-        async start(
+        start(
             initialUnconstrainedIterations: number = 0,
             initialUserConstraintIterations: number = 0,
             initialAllConstraintsIterations: number = 0,
             gridSnapIterations: number = 0,
             keepRunning = true,
             centerGraph = true,
-        ): Promise<this> {
+        ): this {
             var i: number,
                 j: number,
                 n = (<Array<any>>this.nodes()).length,
@@ -599,7 +599,6 @@ import {separateGraphs, applyPacking} from './handledisconnected'
             }
 
             this.avoidOverlaps(false);
-            console.log((this as any).wasm);
             this._descent = new Descent([x, y], D, undefined, (this as any).wasm);
 
             this._descent.locks.clear();

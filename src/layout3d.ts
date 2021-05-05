@@ -78,7 +78,6 @@ export class Link3D {
             var G = Descent.createSquareMatrix(n, function () { return 2 });
             this.links.forEach(({ source, target }) => G[source][target] = G[target][source] = 1);
 
-            console.log((this as any).wasm);
             this.descent = new Descent(this.result, D, undefined, (this as any).wasm);
             this.descent.threshold = 1e-3;
             this.descent.G = G.map(Gn => new Float32Array(Gn));
