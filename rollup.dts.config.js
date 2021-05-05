@@ -1,4 +1,5 @@
 import dts from "rollup-plugin-dts";
+import wasm from "@rollup/plugin-wasm";
 
 export default [
   {
@@ -8,6 +9,6 @@ export default [
       format: "esm",
       banner: 'export as namespace cola;'
     }],
-    plugins: [dts()],
+    plugins: [dts(), wasm()],
   },
 ];
