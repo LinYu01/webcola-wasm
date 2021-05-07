@@ -1,10 +1,4 @@
-#![feature(
-    box_syntax,
-    core_intrinsics,
-    wasm_simd,
-    wasm_target_feature,
-    target_feature_11
-)]
+#![feature(box_syntax, core_intrinsics, wasm_simd)]
 #![allow(non_snake_case)]
 
 use core::arch::wasm32::*;
@@ -40,8 +34,7 @@ impl<const DIMS: usize> Context<DIMS> {
         let mut g: Vec<f32> = Vec::with_capacity(DIMS * node_count);
         let mut H: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
         let mut distances: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
-        // let mut distances_squared: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
-        let summed_distances_squared: Vec<f32> = vec![0.; node_count * node_count];
+
         unsafe {
             g.set_len(DIMS * node_count);
             H.set_len(DIMS * node_count * node_count);
@@ -52,6 +45,20 @@ impl<const DIMS: usize> Context<DIMS> {
         for i in 0..DIMS {
             unsafe {
                 Hd.as_mut_ptr().add(i).write(vec![0.; node_count]);
+            }
+        }
+
+        let mut summed_distances: Vec<f32> = vec![0.; node_count * node_count];
+        // This is an optimization to facilitate faster displacment checking.  We set values where u=v to non-zero values so that they aren't treated as needing displacement.
+        for u in 0..node_count {
+            for v in 0..node_count {
+                if u != v {
+                    continue;
+                }
+
+                unsafe {
+                    *summed_distances.get_unchecked_mut(u * node_count + v) = 10000.;
+                }
             }
         }
 
@@ -78,11 +85,11 @@ impl<const DIMS: usize> Context<DIMS> {
             max_h: 0.,
             Hd,
             distances,
-            // distances_squared,
-            summed_distances: summed_distances_squared,
+            summed_distances,
         }
     }
 
+    // #[inline(never)]
     pub fn offset_dir(&mut self) -> [f32; DIMS] {
         let mut u: [f32; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         let mut l = 0.;
@@ -121,12 +128,10 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     /// Returns `true` if any displacements were applied
-    // #[inline(never)]
     fn apply_displacements(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
         let mut did_apply = false;
 
-        // TODO: SIMD-ify + optimize
         for u in 0..n {
             for v in 0..n {
                 if u == v {
@@ -162,13 +167,15 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     // #[inline(never)]
-    #[target_feature(enable = "simd128")]
-    fn compute_distances(&mut self, x: &mut [f32]) {
+    fn compute_distances(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
 
-        // self.zero_summed_squared_distances();
-
         let chunk_count = (n - (n % 4)) / 4;
+
+        // This is a set of flags to facilitate efficient SIMD.  If any of the contained elements are non-zero, then displacements are needed
+        let mut needs_displace = false;
+        let mut needs_to_apply_displacements = unsafe { f32x4_splat(0.) };
+        let displacement_threshold = unsafe { f32x4_splat(0.000000001) };
 
         for i in 0..DIMS {
             for u in 0..n {
@@ -188,9 +195,6 @@ impl<const DIMS: usize> Context<DIMS> {
                         v128_store(distances_out_ptr, distances);
 
                         let distances_squared = f32x4_mul(distances, distances);
-                        // let distances_squared_out_ptr =
-                        //     self.distances_squared.as_mut_ptr().add(out_ix) as *mut v128;
-                        // v128_store(distances_squared_out_ptr, distances_squared);
 
                         let summed_distances_squared_ptr = self
                             .summed_distances
@@ -205,6 +209,14 @@ impl<const DIMS: usize> Context<DIMS> {
                         if i == DIMS - 1 {
                             let sqrted = f32x4_sqrt(summed_distances_squared_v);
                             v128_store(summed_distances_squared_ptr, sqrted);
+
+                            // check here if we need to apply displacements
+                            let any_under_displacement_threshold =
+                                f32x4_lt(sqrted, displacement_threshold);
+                            needs_to_apply_displacements = f32x4_max(
+                                needs_to_apply_displacements,
+                                any_under_displacement_threshold,
+                            );
                         } else {
                             v128_store(summed_distances_squared_ptr, summed_distances_squared_v);
                         }
@@ -217,20 +229,37 @@ impl<const DIMS: usize> Context<DIMS> {
                         let distance = *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v);
                         let distance_squared = distance * distance;
                         *self.distances.get_unchecked_mut(out_ix) = distance;
-                        // *self.distances_squared.get_unchecked_mut(out_ix) = distance_squared;
                         *self.summed_distances.get_unchecked_mut(u * n + v) += distance_squared;
+                        if i == DIMS - 1 {
+                            let sqrtd = self.summed_distances.get_unchecked_mut(u * n + v).sqrt();
+                            *self.summed_distances.get_unchecked_mut(u * n + v) = sqrtd;
+
+                            if sqrtd < 0.000000001 {
+                                needs_displace = true;
+                            }
+                        }
                     }
                 }
             }
+        }
+
+        unsafe {
+            needs_displace
+                || f32x4_extract_lane::<0>(needs_to_apply_displacements) != 0.
+                || f32x4_extract_lane::<1>(needs_to_apply_displacements) != 0.
+                || f32x4_extract_lane::<2>(needs_to_apply_displacements) != 0.
+                || f32x4_extract_lane::<3>(needs_to_apply_displacements) != 0.
         }
     }
 
     pub fn compute(&mut self, x: &mut [f32]) {
         // Pre-compute distances and distances squared between all nodes
         loop {
-            unsafe {
-                self.compute_distances(x);
+            let needs_displacement = self.compute_distances(x);
+            if !needs_displacement {
+                break;
             }
+
             let did_apply = self.apply_displacements(x);
             if !did_apply {
                 break;
@@ -426,9 +455,9 @@ pub fn create_derivative_computer_ctx(
     }
 
     if dimensions == 2 {
-        assert_eq!(D.len(), node_count * node_count);
+        debug_assert_eq!(D.len(), node_count * node_count);
         if !G.is_empty() {
-            assert_eq!(G.len(), node_count * node_count);
+            debug_assert_eq!(G.len(), node_count * node_count);
         }
 
         let ctx: Context<2> = Context::new(
@@ -442,9 +471,9 @@ pub fn create_derivative_computer_ctx(
         );
         Box::into_raw(box ctx) as _
     } else if dimensions == 3 {
-        assert_eq!(D.len(), node_count * node_count);
+        debug_assert_eq!(D.len(), node_count * node_count);
         if !G.is_empty() {
-            assert_eq!(G.len(), node_count * node_count);
+            debug_assert_eq!(G.len(), node_count * node_count);
         }
 
         let ctx: Context<3> = Context::new(
@@ -458,7 +487,11 @@ pub fn create_derivative_computer_ctx(
         );
         Box::into_raw(box ctx) as _
     } else {
-        unimplemented!();
+        if cfg!(debug_assertions) {
+            unimplemented!();
+        } else {
+            unsafe { std::intrinsics::unreachable() }
+        }
     }
 }
 
@@ -469,12 +502,12 @@ pub fn compute_2d(ctx_ptr: *mut Context<2>, mut x: Vec<f32>) -> Vec<f32> {
     x
 }
 
-// #[wasm_bindgen]
-// pub fn compute_3d(ctx_ptr: *mut Context<3>, mut x: Vec<f32>) -> Vec<f32> {
-//     let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
-//     ctx.compute(&mut x);
-//     x
-// }
+#[wasm_bindgen]
+pub fn compute_3d(ctx_ptr: *mut Context<3>, mut x: Vec<f32>) -> Vec<f32> {
+    let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
+    ctx.compute(&mut x);
+    x
+}
 
 #[wasm_bindgen]
 pub fn apply_lock_2d(
@@ -489,20 +522,20 @@ pub fn apply_lock_2d(
     ctx.apply_lock(u, [p_0, p_1], [x_0_u, x_1_u]);
 }
 
-// #[wasm_bindgen]
-// pub fn apply_lock_3d(
-//     ctx_ptr: *mut Context<3>,
-//     u: usize,
-//     p_0: f32,
-//     p_1: f32,
-//     p_2: f32,
-//     x_0_u: f32,
-//     x_1_u: f32,
-//     x_2_u: f32,
-// ) {
-//     let ctx = unsafe { &mut *ctx_ptr };
-//     ctx.apply_lock(u, [p_0, p_1, p_2], [x_0_u, x_1_u, x_2_u]);
-// }
+#[wasm_bindgen]
+pub fn apply_lock_3d(
+    ctx_ptr: *mut Context<3>,
+    u: usize,
+    p_0: f32,
+    p_1: f32,
+    p_2: f32,
+    x_0_u: f32,
+    x_1_u: f32,
+    x_2_u: f32,
+) {
+    let ctx = unsafe { &mut *ctx_ptr };
+    ctx.apply_lock(u, [p_0, p_1, p_2], [x_0_u, x_1_u, x_2_u]);
+}
 
 #[wasm_bindgen]
 pub fn compute_step_size_2d(ctx_ptr: *mut Context<2>) -> f32 {
@@ -510,11 +543,11 @@ pub fn compute_step_size_2d(ctx_ptr: *mut Context<2>) -> f32 {
     ctx.compute_step_size()
 }
 
-// #[wasm_bindgen]
-// pub fn compute_step_size_3d(ctx_ptr: *mut Context<3>) -> f32 {
-//     let ctx = unsafe { &mut *ctx_ptr };
-//     ctx.compute_step_size()
-// }
+#[wasm_bindgen]
+pub fn compute_step_size_3d(ctx_ptr: *mut Context<3>) -> f32 {
+    let ctx = unsafe { &mut *ctx_ptr };
+    ctx.compute_step_size()
+}
 
 #[wasm_bindgen]
 pub fn get_memory() -> JsValue {
