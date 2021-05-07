@@ -13,7 +13,7 @@ console_error_panic_hook = "0.1.6"
 wasm-bindgen = { version = "=0.2.73", features = ["nightly"] }
 
 [profile.release]
-#debug-assertions = true
+# debug-assertions = true
 panic = "abort"
 debug = 1
 codegen-units = 1

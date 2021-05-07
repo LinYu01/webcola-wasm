@@ -1,6 +1,13 @@
-#![feature(box_syntax, core_intrinsics)]
+#![feature(
+    box_syntax,
+    core_intrinsics,
+    wasm_simd,
+    wasm_target_feature,
+    target_feature_11
+)]
 #![allow(non_snake_case)]
 
+use core::arch::wasm32::*;
 use rand::prelude::*;
 use rand_pcg::Pcg32;
 use wasm_bindgen::prelude::*;
@@ -14,7 +21,7 @@ pub struct Context<const DIMS: usize> {
     pub H: Vec<f32>,
     /// matrix of desired distances between pairs of nodes
     pub D: Vec<f32>,
-    pub G: Option<Vec<f32>>,
+    pub G: Vec<f32>,
     rng: Pcg32,
     min_d: f32,
     // snap_grid_size: f32,
@@ -22,15 +29,23 @@ pub struct Context<const DIMS: usize> {
     max_h: f32,
     /// Scratch buffer used during step size computation
     Hd: [Vec<f32>; DIMS],
+    /// Scratch buffer used to hold distances between all nodes
+    distances: Vec<f32>,
+    /// Holds square root of the sums of all distances squared for all dimensions
+    summed_distances: Vec<f32>,
 }
 
 impl<const DIMS: usize> Context<DIMS> {
-    pub fn new(D: Vec<f32>, G: Option<Vec<f32>>, node_count: usize) -> Self {
+    pub fn new(D: Vec<f32>, G: Vec<f32>, node_count: usize) -> Self {
         let mut g: Vec<f32> = Vec::with_capacity(DIMS * node_count);
         let mut H: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
+        let mut distances: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
+        // let mut distances_squared: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
+        let summed_distances_squared: Vec<f32> = vec![0.; node_count * node_count];
         unsafe {
-            H.set_len(DIMS * node_count * node_count);
             g.set_len(DIMS * node_count);
+            H.set_len(DIMS * node_count * node_count);
+            distances.set_len(DIMS * node_count * node_count);
         };
         let mut Hd: [Vec<f32>; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
 
@@ -62,6 +77,9 @@ impl<const DIMS: usize> Context<DIMS> {
             // snap_strength: 1000.,
             max_h: 0.,
             Hd,
+            distances,
+            // distances_squared,
+            summed_distances: summed_distances_squared,
         }
     }
 
@@ -102,30 +120,132 @@ impl<const DIMS: usize> Context<DIMS> {
         }
     }
 
-    pub fn compute(&mut self, x: &mut [f32]) {
-        // distance vector
-        let mut d: [f32; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        // distance vector squared
-        let mut d2: [f32; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        // Hessian diagonal
-        let mut Huu: [f32; DIMS] = [0.; DIMS];
-        let mut max_h: f32 = 0.;
+    /// Returns `true` if any displacements were applied
+    // #[inline(never)]
+    fn apply_displacements(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
+        let mut did_apply = false;
 
-        // across all nodes u
-        for u in 0..self.n {
-            // zero gradient and hessian diagonals
-            for i in 0..DIMS {
-                if cfg!(debug_assertions) {
-                    Huu[i] = 0.;
-                    self.g[i * n + u] = 0.;
+        // TODO: SIMD-ify + optimize
+        for u in 0..n {
+            for v in 0..n {
+                if u == v {
+                    continue;
+                }
+
+                let summed_distance_squared = if cfg!(debug_assertions) {
+                    self.summed_distances[u * n + v]
                 } else {
-                    unsafe {
-                        *Huu.get_unchecked_mut(i) = 0.;
-                        *self.g.get_unchecked_mut(i * n + u) = 0.;
+                    unsafe { *self.summed_distances.get_unchecked(u * n + v) }
+                };
+                if summed_distance_squared > 0.000000001 {
+                    continue;
+                }
+
+                did_apply = true;
+
+                let rd = self.offset_dir();
+
+                for i in 0..DIMS {
+                    if cfg!(debug_assertions) {
+                        x[i * n + v] += rd[i];
+                    } else {
+                        unsafe {
+                            *x.get_unchecked_mut(i * n + v) += rd[i];
+                        }
                     }
                 }
             }
+        }
+
+        did_apply
+    }
+
+    // #[inline(never)]
+    #[target_feature(enable = "simd128")]
+    fn compute_distances(&mut self, x: &mut [f32]) {
+        let n = self.n;
+
+        // self.zero_summed_squared_distances();
+
+        let chunk_count = (n - (n % 4)) / 4;
+
+        for i in 0..DIMS {
+            for u in 0..n {
+                unsafe {
+                    let u_vector =
+                        v32x4_load_splat(x.get_unchecked(i * n + u) as *const f32 as *const u32);
+
+                    for v_chunk_ix in 0..chunk_count {
+                        let v_vector =
+                            v128_load(x.as_ptr().add(i * n + v_chunk_ix * 4) as *const v128);
+
+                        let distances = f32x4_sub(u_vector, v_vector);
+                        let out_ix = (i * n * n) + (u * n) + v_chunk_ix * 4;
+
+                        let distances_out_ptr =
+                            self.distances.as_mut_ptr().add(out_ix) as *mut v128;
+                        v128_store(distances_out_ptr, distances);
+
+                        let distances_squared = f32x4_mul(distances, distances);
+                        // let distances_squared_out_ptr =
+                        //     self.distances_squared.as_mut_ptr().add(out_ix) as *mut v128;
+                        // v128_store(distances_squared_out_ptr, distances_squared);
+
+                        let summed_distances_squared_ptr = self
+                            .summed_distances
+                            .as_mut_ptr()
+                            .add(u * n + v_chunk_ix * 4)
+                            as *mut v128;
+                        let summed_distances_squared_v = v128_load(summed_distances_squared_ptr);
+                        let summed_distances_squared_v =
+                            f32x4_add(distances_squared, summed_distances_squared_v);
+
+                        // sqrt it on the last iteration
+                        if i == DIMS - 1 {
+                            let sqrted = f32x4_sqrt(summed_distances_squared_v);
+                            v128_store(summed_distances_squared_ptr, sqrted);
+                        } else {
+                            v128_store(summed_distances_squared_ptr, summed_distances_squared_v);
+                        }
+                    }
+
+                    // Multiply the last partial chunk manually
+                    for v in (chunk_count * 4)..n {
+                        let out_ix = (i * n * n) + (u * n) + v;
+
+                        let distance = *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v);
+                        let distance_squared = distance * distance;
+                        *self.distances.get_unchecked_mut(out_ix) = distance;
+                        // *self.distances_squared.get_unchecked_mut(out_ix) = distance_squared;
+                        *self.summed_distances.get_unchecked_mut(u * n + v) += distance_squared;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn compute(&mut self, x: &mut [f32]) {
+        // Pre-compute distances and distances squared between all nodes
+        loop {
+            unsafe {
+                self.compute_distances(x);
+            }
+            let did_apply = self.apply_displacements(x);
+            if !did_apply {
+                break;
+            }
+        }
+
+        let mut max_h: f32 = 0.;
+        let n = self.n;
+
+        self.g.fill(0.);
+
+        // across all nodes u
+        for u in 0..self.n {
+            // Hessian diagonal
+            let mut Huu: [f32; DIMS] = [0.; DIMS];
 
             // across all nodes v
             for v in 0..self.n {
@@ -133,60 +253,39 @@ impl<const DIMS: usize> Context<DIMS> {
                     continue;
                 }
 
-                // The following loop computes distance vector and
-                // randomly displaces nodes that are at identical positions
-                let max_displaces = self.n;
-                let mut distance_squared = 0.0f32;
-                for _ in 0..max_displaces {
-                    distance_squared = 0.;
-                    for i in 0..DIMS {
-                        let dx = if cfg!(debug_assertions) {
-                            x[i * n + u] - x[i * n + v]
-                        } else {
-                            unsafe { *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v) }
-                        };
-                        let dx2 = dx * dx;
-                        d[i] = dx;
-                        d2[i] = dx2;
-                        distance_squared += dx2;
+                let distance = if cfg!(debug_assertions) {
+                    let val = self.summed_distances[u * n + v];
+                    self.summed_distances[u * n + v] = 0.;
+                    val
+                } else {
+                    unsafe {
+                        let ptr = self.summed_distances.get_unchecked_mut(u * n + v);
+                        let val = *ptr;
+                        *ptr = 0.;
+                        val
                     }
+                };
 
-                    if std::intrinsics::likely(distance_squared > 0.000000001) {
-                        break;
-                    }
-                    let rd = self.offset_dir();
-
-                    for i in 0..DIMS {
-                        if cfg!(debug_assertions) {
-                            x[i * n + v] += rd[i];
-                        } else {
-                            unsafe {
-                                *x.get_unchecked_mut(i * n + v) += *rd.get_unchecked(i);
-                            }
-                        }
-                    }
-                }
-                let distance = distance_squared.sqrt();
+                let distance_squared = distance * distance;
                 let ideal_distance = if cfg!(debug_assertions) {
                     self.D[u * n + v]
                 } else {
                     unsafe { *self.D.get_unchecked(u * n + v) }
                 };
-                // if ideal_distance == 0. {
-                //     panic!("ideal_distance=0; self.D={:?}", self.D);
-                // }
+
+                if cfg!(debug_assertions) {
+                    if ideal_distance == 0. {
+                        panic!("ideal_distance={}; u={}, v={}", ideal_distance, u, v);
+                    }
+                }
+
                 // weights are passed via G matrix.
                 // weight > 1 means not immediately connected
                 // small weights (<<1) are used for group dummy nodes
-                let mut weight = match self.G.as_ref() {
-                    Some(G) => {
-                        if cfg!(debug_assertions) {
-                            G[u * n + v]
-                        } else {
-                            unsafe { *G.get_unchecked(u * n + v) }
-                        }
-                    }
-                    None => 1.,
+                let mut weight = if cfg!(debug_assertions) {
+                    self.G[u * n + v]
+                } else {
+                    unsafe { *self.G.get_unchecked(u * n + v) }
                 };
 
                 // ignore long range attractions for nodes not immediately connected (P-stress)
@@ -210,11 +309,16 @@ impl<const DIMS: usize> Context<DIMS> {
                 let hs = 2. * -weight / (ideal_distance_squared * distance_cubed);
                 if cfg!(debug_assertions) {
                     if !gs.is_finite() {
-                        if !weight.is_finite() {
+                        if !distance_squared.is_normal() {
+                            panic!(
+                                "bad distance squared: {}, u={}, v={}",
+                                distance_squared, u, v
+                            );
+                        } else if !weight.is_finite() {
                             panic!("bad weight: {}", weight);
-                        } else if !distance.is_finite() {
+                        } else if !distance.is_normal() {
                             panic!();
-                        } else if !ideal_distance.is_finite() {
+                        } else if !ideal_distance.is_normal() {
                             panic!();
                         }
 
@@ -223,9 +327,16 @@ impl<const DIMS: usize> Context<DIMS> {
                 }
 
                 for i in 0..DIMS {
-                    self.g[i * n + u] += d[i] * gs;
-                    let idk =
-                        hs * (2. * distance_cubed + ideal_distance * (d2[i] - distance_squared));
+                    let distance = if cfg!(debug_assertions) {
+                        self.distances[(i * n * n) + u * n + v]
+                    } else {
+                        unsafe { *self.distances.get_unchecked((i * n * n) + u * n + v) }
+                    };
+
+                    self.g[i * n + u] += distance * gs;
+                    let idk = hs
+                        * (2. * distance_cubed
+                            + ideal_distance * (distance * distance - distance_squared));
                     self.set_H(i, u, v, idk);
                     Huu[i] -= idk;
                 }
@@ -320,8 +431,15 @@ pub fn create_derivative_computer_ctx(
             assert_eq!(G.len(), node_count * node_count);
         }
 
-        let ctx: Context<2> =
-            Context::new(D, if G.is_empty() { None } else { Some(G) }, node_count);
+        let ctx: Context<2> = Context::new(
+            D,
+            if G.is_empty() {
+                vec![1.; node_count * node_count]
+            } else {
+                G
+            },
+            node_count,
+        );
         Box::into_raw(box ctx) as _
     } else if dimensions == 3 {
         assert_eq!(D.len(), node_count * node_count);
@@ -329,8 +447,15 @@ pub fn create_derivative_computer_ctx(
             assert_eq!(G.len(), node_count * node_count);
         }
 
-        let ctx: Context<3> =
-            Context::new(D, if G.is_empty() { None } else { Some(G) }, node_count);
+        let ctx: Context<3> = Context::new(
+            D,
+            if G.is_empty() {
+                vec![1.; node_count * node_count]
+            } else {
+                G
+            },
+            node_count,
+        );
         Box::into_raw(box ctx) as _
     } else {
         unimplemented!();
@@ -344,12 +469,12 @@ pub fn compute_2d(ctx_ptr: *mut Context<2>, mut x: Vec<f32>) -> Vec<f32> {
     x
 }
 
-#[wasm_bindgen]
-pub fn compute_3d(ctx_ptr: *mut Context<3>, mut x: Vec<f32>) -> Vec<f32> {
-    let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
-    ctx.compute(&mut x);
-    x
-}
+// #[wasm_bindgen]
+// pub fn compute_3d(ctx_ptr: *mut Context<3>, mut x: Vec<f32>) -> Vec<f32> {
+//     let ctx: &mut Context<3> = unsafe { &mut *ctx_ptr };
+//     ctx.compute(&mut x);
+//     x
+// }
 
 #[wasm_bindgen]
 pub fn apply_lock_2d(
@@ -364,20 +489,20 @@ pub fn apply_lock_2d(
     ctx.apply_lock(u, [p_0, p_1], [x_0_u, x_1_u]);
 }
 
-#[wasm_bindgen]
-pub fn apply_lock_3d(
-    ctx_ptr: *mut Context<3>,
-    u: usize,
-    p_0: f32,
-    p_1: f32,
-    p_2: f32,
-    x_0_u: f32,
-    x_1_u: f32,
-    x_2_u: f32,
-) {
-    let ctx = unsafe { &mut *ctx_ptr };
-    ctx.apply_lock(u, [p_0, p_1, p_2], [x_0_u, x_1_u, x_2_u]);
-}
+// #[wasm_bindgen]
+// pub fn apply_lock_3d(
+//     ctx_ptr: *mut Context<3>,
+//     u: usize,
+//     p_0: f32,
+//     p_1: f32,
+//     p_2: f32,
+//     x_0_u: f32,
+//     x_1_u: f32,
+//     x_2_u: f32,
+// ) {
+//     let ctx = unsafe { &mut *ctx_ptr };
+//     ctx.apply_lock(u, [p_0, p_1, p_2], [x_0_u, x_1_u, x_2_u]);
+// }
 
 #[wasm_bindgen]
 pub fn compute_step_size_2d(ctx_ptr: *mut Context<2>) -> f32 {
@@ -385,11 +510,11 @@ pub fn compute_step_size_2d(ctx_ptr: *mut Context<2>) -> f32 {
     ctx.compute_step_size()
 }
 
-#[wasm_bindgen]
-pub fn compute_step_size_3d(ctx_ptr: *mut Context<3>) -> f32 {
-    let ctx = unsafe { &mut *ctx_ptr };
-    ctx.compute_step_size()
-}
+// #[wasm_bindgen]
+// pub fn compute_step_size_3d(ctx_ptr: *mut Context<3>) -> f32 {
+//     let ctx = unsafe { &mut *ctx_ptr };
+//     ctx.compute_step_size()
+// }
 
 #[wasm_bindgen]
 pub fn get_memory() -> JsValue {
@@ -425,12 +550,12 @@ pub fn get_g_3d(ctx: *mut Context<3>) -> *mut f32 {
 #[wasm_bindgen]
 pub fn set_G_2d(ctx: *mut Context<2>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
-    assert_eq!(new_G.len(), ctx.n * ctx.n);
-    ctx.G = Some(new_G);
+    // assert_eq!(new_G.len(), ctx.n * ctx.n);
+    ctx.G = new_G;
 }
 
 #[wasm_bindgen]
 pub fn set_G_3d(ctx: *mut Context<3>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
-    ctx.G = Some(new_G);
+    ctx.G = new_G;
 }
