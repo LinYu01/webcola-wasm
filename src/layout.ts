@@ -5,6 +5,10 @@ import {Rectangle, Projection, makeEdgeTo, makeEdgeBetween} from './rectangle'
 import {Calculator} from './shortestpaths'
 import {TangentVisibilityGraph, TVGPoint} from './geom'
 import {separateGraphs, applyPacking} from './handledisconnected'
+import { getDerivativeComputerWasm } from './wasmEngine'
+
+// Kick this off right away since we're going to need it eventually
+const wasmInstPromise = getDerivativeComputerWasm();
 
     /**
      * The layout process fires three events:
@@ -496,14 +500,14 @@ import {separateGraphs, applyPacking} from './handledisconnected'
          * @param [keepRunning=true] keep iterating shronously via the tick method
          * @param [centerGraph=true] Center graph on restart
          */
-        start(
+        async start(
             initialUnconstrainedIterations: number = 0,
             initialUserConstraintIterations: number = 0,
             initialAllConstraintsIterations: number = 0,
             gridSnapIterations: number = 0,
             keepRunning = true,
             centerGraph = true,
-        ): this {
+        ): Promise<this> {
             var i: number,
                 j: number,
                 n = (<Array<any>>this.nodes()).length,
@@ -599,7 +603,8 @@ import {separateGraphs, applyPacking} from './handledisconnected'
             }
 
             this.avoidOverlaps(false);
-            this._descent = new Descent([x, y], D, undefined, (this as any).wasm);
+            const wasmInst = await wasmInstPromise;
+            this._descent = new Descent([x, y], D, undefined, wasmInst);
 
             this._descent.locks.clear();
             for (var i = 0; i < n; ++i) {

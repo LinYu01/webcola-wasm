@@ -1,3 +1,5 @@
+import type { DerivativeComputerWasmInst } from "wasmEngine";
+
     /**
      * Descent respects a collection of locks over nodes that should not move
      * @class Locks
@@ -54,7 +56,7 @@ DEBUG */
      * @class Descent
      */
     export class Descent {
-        private wasm: any; // typeof import('./wasm/wasm');
+        private wasm: DerivativeComputerWasmInst;
         private ctxPtr: number;
 
         public threshold: number = 0.0001;
@@ -71,9 +73,16 @@ DEBUG */
                 .fill(null)
                 .map((_, i) => memoryView.subarray(gOffset + i * this.n, gOffset + i * this.n + this.n));
         }
-        public set G(newG: Float32Array[])  {
-            const allG = new Float32Array(this.n * this.n);
-            newG.forEach((Gn, i) => allG.set(Gn, i * this.n));
+        public set G(newG: Float32Array[] | null)  {
+            const allG = (() => {
+                if (newG) {
+                    const allG = new Float32Array(this.n * this.n);
+                    newG.forEach((Gn, i) => allG.set(Gn, i * this.n));
+                    return allG;
+                } else {
+                    return new Float32Array();
+                }
+            })();
 
             if (this.k === 2) {
                 this.wasm.set_G_2d(this.ctxPtr, allG);
@@ -103,7 +112,7 @@ DEBUG */
             const memory: WebAssembly.Memory = this.wasm.get_memory();
             const memoryView = new Float32Array(memory.buffer);
 
-            const DPtr = this.k === 2 ? this.wasm.get_D_2d(this.ctxPtr) : this.wasm.get_d_3d(this.ctxPtr);
+            const DPtr = this.k === 2 ? this.wasm.get_D_2d(this.ctxPtr) : this.wasm.get_D_3d(this.ctxPtr);
             const DOffset = DPtr / BYTES_PER_F32;
             return new Array(this.n)
                 .fill(null)
@@ -184,9 +193,7 @@ DEBUG */
 
         public project: { (x0: Float32Array, y0: Float32Array, r: Float32Array): void }[] = null;
 
-        private setupWasm(wasm: /* typeof import('./wasm/wasm') */ any, D: number[][], G: number[][] | null = null) {
-            this.wasm = wasm;
-            // Concat all x into a single vector
+        private setupWasm(D: number[][], G: number[][] | null = null) {
             const allD = new Float32Array(this.n * this.n);
             const allG = G ? new Float32Array(this.n * this.k) : new Float32Array(0);
             D.forEach((dn, i) => {
@@ -197,7 +204,9 @@ DEBUG */
                     allG.set(gn, i * this.n);
                 });
             }
-            this.ctxPtr = this.wasm.create_derivative_computer_ctx(this.k, this.n, allD, allG);
+
+            const createrFn = this.k === 2 ? this.wasm.create_derivative_computer_ctx_2d : this.wasm.create_derivative_computer_ctx_3d;
+            this.ctxPtr = createrFn(this.n, allD, allG);
         }
 
         /**
@@ -208,13 +217,14 @@ DEBUG */
          * If G[i][j] > 1 and the separation between nodes i and j is greater than their ideal distance, then there is no contribution for this pair to the goal
          * If G[i][j] <= 1 then it is used as a weighting on the contribution of the variance between ideal and actual separation between i and j to the goal function
          */
-        constructor(x: number[][], D: number[][], G: number[][] = null, wasm: /* typeof import('./wasm/wasm') */ any) {
+        constructor(x: number[][], D: number[][], G: number[][] = null, wasm: DerivativeComputerWasmInst) {
+            this.wasm = wasm;
             this.x = x.map(xn => new Float32Array(xn));
             this.k = x.length; // dimensionality
             var n = this.n = x[0].length; // number of nodes
 
             // Set up Wasm context
-            this.setupWasm(wasm, D, G);
+            this.setupWasm(D, G);
 
             this.a = new Array(this.k);
             this.b = new Array(this.k);

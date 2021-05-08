@@ -538,55 +538,57 @@ impl<const DIMS: usize> Context<DIMS> {
 }
 
 #[wasm_bindgen]
-pub fn create_derivative_computer_ctx(
-    dimensions: usize,
+pub fn create_derivative_computer_ctx_2d(
     node_count: usize,
     D: Vec<f32>,
     G: Vec<f32>,
-) -> usize {
+) -> *mut Context<2> {
     if cfg!(debug_assertions) {
         console_error_panic_hook::set_once();
     }
 
-    if dimensions == 2 {
-        debug_assert_eq!(D.len(), node_count * node_count);
-        if !G.is_empty() {
-            debug_assert_eq!(G.len(), node_count * node_count);
-        }
-
-        let ctx: Context<2> = Context::new(
-            D,
-            if G.is_empty() {
-                vec![1.; node_count * node_count]
-            } else {
-                G
-            },
-            node_count,
-        );
-        Box::into_raw(box ctx) as _
-    } else if dimensions == 3 {
-        debug_assert_eq!(D.len(), node_count * node_count);
-        if !G.is_empty() {
-            debug_assert_eq!(G.len(), node_count * node_count);
-        }
-
-        let ctx: Context<3> = Context::new(
-            D,
-            if G.is_empty() {
-                vec![1.; node_count * node_count]
-            } else {
-                G
-            },
-            node_count,
-        );
-        Box::into_raw(box ctx) as _
-    } else {
-        if cfg!(debug_assertions) {
-            unimplemented!();
-        } else {
-            unsafe { std::intrinsics::unreachable() }
-        }
+    debug_assert_eq!(D.len(), node_count * node_count);
+    if !G.is_empty() {
+        debug_assert_eq!(G.len(), node_count * node_count);
     }
+
+    let ctx: Context<2> = Context::new(
+        D,
+        if G.is_empty() {
+            vec![1.; node_count * node_count]
+        } else {
+            G
+        },
+        node_count,
+    );
+    Box::into_raw(box ctx)
+}
+
+#[wasm_bindgen]
+pub fn create_derivative_computer_ctx_3d(
+    node_count: usize,
+    D: Vec<f32>,
+    G: Vec<f32>,
+) -> *mut Context<3> {
+    if cfg!(debug_assertions) {
+        console_error_panic_hook::set_once();
+    }
+
+    debug_assert_eq!(D.len(), node_count * node_count);
+    if !G.is_empty() {
+        debug_assert_eq!(G.len(), node_count * node_count);
+    }
+
+    let ctx: Context<3> = Context::new(
+        D,
+        if G.is_empty() {
+            vec![1.; node_count * node_count]
+        } else {
+            G
+        },
+        node_count,
+    );
+    Box::into_raw(box ctx)
 }
 
 #[wasm_bindgen]
@@ -678,11 +680,19 @@ pub fn get_g_3d(ctx: *mut Context<3>) -> *mut f32 {
 pub fn set_G_2d(ctx: *mut Context<2>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
     // assert_eq!(new_G.len(), ctx.n * ctx.n);
-    ctx.G = new_G;
+    ctx.G = if new_G.is_empty() {
+        vec![1.; ctx.n * ctx.n]
+    } else {
+        new_G
+    };
 }
 
 #[wasm_bindgen]
 pub fn set_G_3d(ctx: *mut Context<3>, new_G: Vec<f32>) {
     let ctx = unsafe { &mut *ctx };
-    ctx.G = new_G;
+    ctx.G = if new_G.is_empty() {
+        vec![1.; ctx.n * ctx.n]
+    } else {
+        new_G
+    };
 }
