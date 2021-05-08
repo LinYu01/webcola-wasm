@@ -1,6 +1,7 @@
 #![feature(box_syntax, core_intrinsics, wasm_simd)]
 #![allow(non_snake_case)]
 
+#[cfg(feature = "simd")]
 use core::arch::wasm32::*;
 use rand::prelude::*;
 use rand_pcg::Pcg32;
@@ -128,6 +129,7 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     /// Returns `true` if any displacements were applied
+    #[inline(never)]
     fn apply_displacements(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
         let mut did_apply = false;
@@ -166,7 +168,38 @@ impl<const DIMS: usize> Context<DIMS> {
         did_apply
     }
 
-    // #[inline(never)]
+    #[cfg(not(feature = "simd"))]
+    fn compute_distances(&mut self, x: &mut [f32]) -> bool {
+        let n = self.n;
+        let mut needs_displace = false;
+
+        for i in 0..DIMS {
+            for u in 0..n {
+                for v in 0..n {
+                    unsafe {
+                        let out_ix = (i * n * n) + (u * n) + v;
+
+                        let distance = *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v);
+                        let distance_squared = distance * distance;
+                        *self.distances.get_unchecked_mut(out_ix) = distance;
+                        *self.summed_distances.get_unchecked_mut(u * n + v) += distance_squared;
+                        if i == DIMS - 1 {
+                            let sqrtd = self.summed_distances.get_unchecked_mut(u * n + v).sqrt();
+                            *self.summed_distances.get_unchecked_mut(u * n + v) = sqrtd;
+
+                            if sqrtd < 0.000000001 {
+                                needs_displace = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        needs_displace
+    }
+
+    #[cfg(feature = "simd")]
     fn compute_distances(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
 
@@ -336,6 +369,7 @@ impl<const DIMS: usize> Context<DIMS> {
                     2. * weight * (distance - ideal_distance) / (ideal_distance_squared * distance);
                 let distance_cubed = distance_squared * distance;
                 let hs = 2. * -weight / (ideal_distance_squared * distance_cubed);
+
                 if cfg!(debug_assertions) {
                     if !gs.is_finite() {
                         if !distance_squared.is_normal() {
@@ -362,7 +396,11 @@ impl<const DIMS: usize> Context<DIMS> {
                         unsafe { *self.distances.get_unchecked((i * n * n) + u * n + v) }
                     };
 
-                    self.g[i * n + u] += distance * gs;
+                    if cfg!(debug_assertions) {
+                        self.g[i * n + u] += distance * gs;
+                    } else {
+                        unsafe { *self.g.get_unchecked_mut(i * n + u) += distance * gs };
+                    }
                     let idk = hs
                         * (2. * distance_cubed
                             + ideal_distance * (distance * distance - distance_squared));
@@ -372,7 +410,10 @@ impl<const DIMS: usize> Context<DIMS> {
             }
             for i in 0..DIMS {
                 self.set_H(i, u, u, Huu[i]);
-                max_h = max_h.max(Huu[i]);
+                if Huu[i] > max_h {
+                    max_h = Huu[i];
+                }
+                // max_h = max_h.max(Huu[i]);
             }
         }
 
@@ -396,22 +437,58 @@ impl<const DIMS: usize> Context<DIMS> {
         }
     }
 
-    fn dot_prod(a: &[f32], b: &[f32]) -> f32 {
-        let mut x = 0.;
-        debug_assert_eq!(a.len(), b.len());
-        for i in 0..a.len() {
-            x += unsafe { *a.get_unchecked(i) * *b.get_unchecked(i) };
+    #[cfg(not(feature = "simd"))]
+    fn dot_prod(a: *const f32, b: *const f32, count: usize) -> f32 {
+        let mut out = 0.;
+        for i in 0..count {
+            out += unsafe { *a.add(i) * *b.add(i) };
         }
-        x
+        out
+    }
+
+    #[cfg(feature = "simd")]
+    fn dot_prod(a: *const f32, b: *const f32, count: usize) -> f32 {
+        let mut vector_sum = unsafe { f32x4_splat(0.) };
+        let chunk_count = (count - (count % 4)) / 4;
+        for chunk_ix in 0..chunk_count {
+            let i = chunk_ix * 4;
+            unsafe {
+                let a_n = v128_load(a.add(i) as *const v128);
+                let b_n = v128_load(b.add(i) as *const v128);
+                let multiplied = f32x4_mul(a_n, b_n);
+                vector_sum = f32x4_add(vector_sum, multiplied);
+            }
+        }
+
+        let mut sum = unsafe {
+            f32x4_extract_lane::<0>(vector_sum)
+                + f32x4_extract_lane::<1>(vector_sum)
+                + f32x4_extract_lane::<2>(vector_sum)
+                + f32x4_extract_lane::<3>(vector_sum)
+        };
+
+        // Remainder
+        for i in (chunk_count * 4)..count {
+            sum += unsafe { *a.add(i) * *b.add(i) };
+        }
+
+        sum
     }
 
     /// result r = matrix m * vector v
-    fn right_multiply<'a>(m: impl Iterator<Item = &'a [f32]>, v: &[f32], r: &mut [f32]) {
-        for (i, mn) in m.enumerate() {
+    fn right_multiply<'a>(
+        m: *const f32,
+        m_chunk_count: usize,
+        m_chunk_size: usize,
+        v: *const f32,
+        r: &mut [f32],
+    ) {
+        for i in 0..m_chunk_count {
+            let mn = unsafe { m.add(i * m_chunk_size) };
             if cfg!(debug_assertions) {
-                r[i] = Self::dot_prod(mn, v);
+                r[i] = Self::dot_prod(mn, v, m_chunk_size);
             } else {
-                unsafe { *r.get_unchecked_mut(i) = Self::dot_prod(mn, v) };
+                unsafe { *r.get_unchecked_mut(i) = Self::dot_prod(mn, v, m_chunk_size) };
             }
         }
     }
@@ -426,14 +503,31 @@ impl<const DIMS: usize> Context<DIMS> {
         let H_dim_size = self.n * self.n;
         let n = self.n;
 
-        for (i, gn) in self.g.chunks_exact(n).enumerate() {
-            numerator += Self::dot_prod(gn, gn);
+        for i in 0..DIMS {
+            let gn = unsafe { self.g.as_ptr().add(i * n) };
+
+            numerator += Self::dot_prod(gn, gn, n);
+            let Hd_i = if cfg!(debug_assertions) {
+                &mut self.Hd[i]
+            } else {
+                unsafe { self.Hd.get_unchecked_mut(i) }
+            };
             Self::right_multiply(
-                self.H[(i * H_dim_size)..(i * H_dim_size + H_dim_size)].chunks_exact(n),
+                if cfg!(debug_assertions) {
+                    &self.H[(i * H_dim_size)..(i * H_dim_size + H_dim_size)]
+                } else {
+                    unsafe {
+                        self.H
+                            .get_unchecked((i * H_dim_size)..(i * H_dim_size + H_dim_size))
+                    }
+                }
+                .as_ptr(),
+                n,
+                n,
                 gn,
-                &mut self.Hd[i],
+                Hd_i,
             );
-            denominator += Self::dot_prod(gn, &self.Hd[i]);
+            denominator += Self::dot_prod(gn, Hd_i.as_ptr(), n);
         }
 
         if denominator == 0. || !denominator.is_finite() {

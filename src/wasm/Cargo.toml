@@ -21,3 +21,7 @@ lto = "fat"
 
 [profile.dev]
 debug-assertions = true
+
+[features]
+simd = []
+default = ["simd"]
