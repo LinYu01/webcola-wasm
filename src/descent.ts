@@ -205,6 +205,13 @@ DEBUG */
                 });
             }
 
+            allD.forEach((d, i) => {
+                if (d === Infinity) {
+                    allD[i] = -10000000;
+                    allG[i] = 1000.;
+                }
+            });
+
             const createrFn = this.k === 2 ? this.wasm.create_derivative_computer_ctx_2d : this.wasm.create_derivative_computer_ctx_3d;
             this.ctxPtr = createrFn(this.n, allD, allG);
         }

@@ -1,10 +1,10 @@
 #![feature(box_syntax, core_intrinsics, wasm_simd)]
 #![allow(non_snake_case)]
 
-#[cfg(feature = "simd")]
-use core::arch::wasm32::*;
 use rand::prelude::*;
 use rand_pcg::Pcg32;
+#[cfg(feature = "simd")]
+use std::arch::wasm32::*;
 use wasm_bindgen::prelude::*;
 
 pub struct Context<const DIMS: usize> {
@@ -209,12 +209,14 @@ impl<const DIMS: usize> Context<DIMS> {
         let mut needs_displace = false;
         let mut needs_to_apply_displacements = unsafe { f32x4_splat(0.) };
         let displacement_threshold = unsafe { f32x4_splat(0.000000001) };
+        // let displacement_threshold =
+        //     unsafe { v128_load(self.displacement_threshold.as_ptr() as *const _) };
 
         for i in 0..DIMS {
             for u in 0..n {
                 unsafe {
                     let u_vector =
-                        v32x4_load_splat(x.get_unchecked(i * n + u) as *const f32 as *const u32);
+                        v128_load32_splat(x.get_unchecked(i * n + u) as *const f32 as *const u32);
 
                     for v_chunk_ix in 0..chunk_count {
                         let v_vector =
@@ -246,7 +248,7 @@ impl<const DIMS: usize> Context<DIMS> {
                             // check here if we need to apply displacements
                             let any_under_displacement_threshold =
                                 f32x4_lt(sqrted, displacement_threshold);
-                            needs_to_apply_displacements = f32x4_max(
+                            needs_to_apply_displacements = v128_or(
                                 needs_to_apply_displacements,
                                 any_under_displacement_threshold,
                             );
@@ -328,7 +330,6 @@ impl<const DIMS: usize> Context<DIMS> {
                     }
                 };
 
-                let distance_squared = distance * distance;
                 let ideal_distance = if cfg!(debug_assertions) {
                     self.D[u * n + v]
                 } else {
@@ -344,14 +345,23 @@ impl<const DIMS: usize> Context<DIMS> {
                 // weights are passed via G matrix.
                 // weight > 1 means not immediately connected
                 // small weights (<<1) are used for group dummy nodes
-                let mut weight = if cfg!(debug_assertions) {
+                let weight = if cfg!(debug_assertions) {
                     self.G[u * n + v]
                 } else {
                     unsafe { *self.G.get_unchecked(u * n + v) }
                 };
 
                 // ignore long range attractions for nodes not immediately connected (P-stress)
-                if weight > 1. && distance > ideal_distance || !ideal_distance.is_finite() {
+                //
+                // We've done some hacky stuff in the JS wrapper where `ideal_distance` is set to a hugely
+                // negative number and `weight` is set to 1000. if `ideal_distance` is equal to infinity.
+                // This removes the need to do the expensive `is_finite` check but diverges greatly from
+                // what the original JS code did.
+                //
+                // I don't think it's possible in the current codebase for the buffers where `ideal_distance`
+                // and `weight` come from to be messed with/read after the first run, but if that did happen
+                // it would almost certainly break this code.
+                if distance > ideal_distance && weight > 1. {
                     for i in 0..DIMS {
                         self.set_H(i, u, v, 0.);
                     }
@@ -360,10 +370,15 @@ impl<const DIMS: usize> Context<DIMS> {
 
                 // weight > 1 was just an indicator - this is an arcane interface,
                 // but we are trying to be economical storing and passing node pair info
-                if weight > 1. {
-                    weight = 1.;
-                }
+                // if weight > 1. {
+                //     weight = 1.;
+                // }
 
+                // We do not support group/dummy nodes, and so we are able to simplify a lot
+                // of the math here that treats weight as a free variable
+                let weight = 1.;
+
+                let distance_squared = distance * distance;
                 let ideal_distance_squared = ideal_distance * ideal_distance;
                 let gs =
                     2. * weight * (distance - ideal_distance) / (ideal_distance_squared * distance);
