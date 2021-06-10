@@ -28,13 +28,21 @@ pub struct Context<const DIMS: usize> {
     distances: Vec<f32>,
     /// Holds square root of the sums of all distances squared for all dimensions
     summed_distances: Vec<f32>,
+    /// Holds flags indicating whether or not the inner condition passes or not for each pair of nodes
+    inner_condition_flags: Vec<f32>,
 }
+
+/// This is a magical value that we expect no real distance to ever come out to.  It is used to represent
+/// indices where u=v and so the distance is zero, but in order to facilitate efficient displacement checking
+/// we must not have zero values in that array.
+const U_EQ_V_PLACEHOLDER_VAL: f32 = 999_999_999_999_888_233.12128;
 
 impl<const DIMS: usize> Context<DIMS> {
     pub fn new(D: Vec<f32>, G: Vec<f32>, node_count: usize) -> Self {
         let mut g: Vec<f32> = Vec::with_capacity(DIMS * node_count);
         let mut H: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
         let mut distances: Vec<f32> = Vec::with_capacity(DIMS * node_count * node_count);
+        let inner_condition_flags: Vec<f32> = Vec::with_capacity(node_count * node_count);
 
         unsafe {
             g.set_len(DIMS * node_count);
@@ -58,7 +66,8 @@ impl<const DIMS: usize> Context<DIMS> {
                 }
 
                 unsafe {
-                    *summed_distances.get_unchecked_mut(u * node_count + v) = 10000.;
+                    *summed_distances.get_unchecked_mut(u * node_count + v) =
+                        U_EQ_V_PLACEHOLDER_VAL;
                 }
             }
         }
@@ -87,10 +96,10 @@ impl<const DIMS: usize> Context<DIMS> {
             Hd,
             distances,
             summed_distances,
+            inner_condition_flags,
         }
     }
 
-    // #[inline(never)]
     pub fn offset_dir(&mut self) -> [f32; DIMS] {
         let mut u: [f32; DIMS] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         let mut l = 0.;
@@ -140,12 +149,16 @@ impl<const DIMS: usize> Context<DIMS> {
                     continue;
                 }
 
-                let summed_distance_squared = if cfg!(debug_assertions) {
-                    self.summed_distances[u * n + v]
-                } else {
-                    unsafe { *self.summed_distances.get_unchecked(u * n + v) }
-                };
-                if summed_distance_squared > 0.000000001 {
+                // We have to re-compute distances here since we clobber the `summed_distances` array
+                // if the flags match to skip the inner work loop
+                let mut summed_distance_squared = 0.;
+                for i in 0..DIMS {
+                    let dist = unsafe { *self.distances.get_unchecked((i * n * n) + (u * n) + v) };
+                    summed_distance_squared += dist * dist;
+                }
+                let summed_distance = summed_distance_squared.sqrt();
+
+                if summed_distance > 0.000000001 {
                     continue;
                 }
 
@@ -174,6 +187,8 @@ impl<const DIMS: usize> Context<DIMS> {
         let mut needs_displace = false;
 
         for i in 0..DIMS {
+            let mut ix = 0;
+
             for u in 0..n {
                 for v in 0..n {
                     unsafe {
@@ -182,16 +197,29 @@ impl<const DIMS: usize> Context<DIMS> {
                         let distance = *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v);
                         let distance_squared = distance * distance;
                         *self.distances.get_unchecked_mut(out_ix) = distance;
-                        *self.summed_distances.get_unchecked_mut(u * n + v) += distance_squared;
+                        *self.summed_distances.get_unchecked_mut(ix) += distance_squared;
                         if i == DIMS - 1 {
-                            let sqrtd = self.summed_distances.get_unchecked_mut(u * n + v).sqrt();
-                            *self.summed_distances.get_unchecked_mut(u * n + v) = sqrtd;
+                            let sqrtd = self.summed_distances.get_unchecked_mut(ix).sqrt();
+                            *self.summed_distances.get_unchecked_mut(ix) = sqrtd;
 
                             if sqrtd < 0.000000001 {
                                 needs_displace = true;
                             }
+
+                            // compute condition flags that are used in the inner loop.  We can do it here
+                            // using SIMD and store the flags in memory to be read out later.
+                            //
+                            // The gist of what we're computing is this:
+                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            let weight = *self.G.get_unchecked(ix);
+                            let ideal_distance = *self.D.get_unchecked(ix);
+                            let flag = (sqrtd - ideal_distance) * (weight - 1.) > 0.;
+                            *(self.inner_condition_flags.get_unchecked_mut(ix) as *mut f32
+                                as *mut i32) = if flag { -1i32 } else { 0i32 };
                         }
                     }
+
+                    ix += 1;
                 }
             }
         }
@@ -199,18 +227,18 @@ impl<const DIMS: usize> Context<DIMS> {
         needs_displace
     }
 
+    // #[inline(never)]
     #[cfg(feature = "simd")]
     fn compute_distances(&mut self, x: &mut [f32]) -> bool {
         let n = self.n;
-
         let chunk_count = (n - (n % 4)) / 4;
 
         // This is a set of flags to facilitate efficient SIMD.  If any of the contained elements are non-zero, then displacements are needed
         let mut needs_displace = false;
-        let mut needs_to_apply_displacements = unsafe { f32x4_splat(0.) };
+        // all 1s
+        let mut all_over_displacement_threshold =
+            unsafe { f32x4_splat(std::mem::transmute(-1i32)) };
         let displacement_threshold = unsafe { f32x4_splat(0.000000001) };
-        // let displacement_threshold =
-        //     unsafe { v128_load(self.displacement_threshold.as_ptr() as *const _) };
 
         for i in 0..DIMS {
             for u in 0..n {
@@ -236,21 +264,66 @@ impl<const DIMS: usize> Context<DIMS> {
                             .as_mut_ptr()
                             .add(u * n + v_chunk_ix * 4)
                             as *mut v128;
-                        let summed_distances_squared_v = v128_load(summed_distances_squared_ptr);
+                        let summed_distances_squared_v_orig =
+                            v128_load(summed_distances_squared_ptr);
                         let summed_distances_squared_v =
-                            f32x4_add(distances_squared, summed_distances_squared_v);
+                            f32x4_add(distances_squared, summed_distances_squared_v_orig);
 
                         // sqrt it on the last iteration
                         if i == DIMS - 1 {
                             let sqrted = f32x4_sqrt(summed_distances_squared_v);
-                            v128_store(summed_distances_squared_ptr, sqrted);
 
                             // check here if we need to apply displacements
-                            let any_under_displacement_threshold =
-                                f32x4_lt(sqrted, displacement_threshold);
-                            needs_to_apply_displacements = v128_or(
-                                needs_to_apply_displacements,
-                                any_under_displacement_threshold,
+                            let over_displacement_threshold =
+                                f32x4_gt(sqrted, displacement_threshold);
+                            all_over_displacement_threshold = v128_and(
+                                all_over_displacement_threshold,
+                                over_displacement_threshold,
+                            );
+
+                            // compute condition flags that are used in the inner loop.  We can do it here
+                            // using SIMD and store the flags in memory to be read out later.
+                            //
+                            // The gist of what we're computing is this:
+                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            let ideal_distances_v = v128_load(
+                                self.D.get_unchecked(u * n + v_chunk_ix * 4) as *const f32
+                                    as *const _,
+                            );
+                            let weights_v = v128_load(self.G.get_unchecked(u * n + v_chunk_ix * 4)
+                                as *const f32
+                                as *const _);
+
+                            let flags = f32x4_gt(
+                                f32x4_mul(
+                                    f32x4_sub(sqrted, ideal_distances_v),
+                                    f32x4_sub(weights_v, f32x4_splat(1.)),
+                                ),
+                                f32x4_splat(0.),
+                            );
+                            v128_store(
+                                self.inner_condition_flags
+                                    .get_unchecked_mut(u * n + v_chunk_ix * 4)
+                                    as *mut f32 as *mut _,
+                                flags,
+                            );
+
+                            let zeroed_by_flags = v128_andnot(sqrted, flags);
+
+                            // We want to leave sums where u=v as they are in or
+                            let eq_placeholder = f32x4_eq(
+                                summed_distances_squared_v_orig,
+                                f32x4_splat(U_EQ_V_PLACEHOLDER_VAL),
+                            );
+                            // we pre-zero summed distances if the flag is zero, but we need to preserve elements
+                            // where u=v to prevent them from getting zeroed out
+                            v128_store(
+                                summed_distances_squared_ptr,
+                                v128_bitselect(
+                                    summed_distances_squared_v_orig,
+                                    zeroed_by_flags,
+                                    eq_placeholder,
+                                ),
                             );
                         } else {
                             v128_store(summed_distances_squared_ptr, summed_distances_squared_v);
@@ -259,7 +332,15 @@ impl<const DIMS: usize> Context<DIMS> {
 
                     // Multiply the last partial chunk manually
                     for v in (chunk_count * 4)..n {
+                        if u == v {
+                            continue;
+                        }
+
                         let out_ix = (i * n * n) + (u * n) + v;
+
+                        if i == 0 {
+                            *self.summed_distances.get_unchecked_mut(u * n + v) = 0.;
+                        }
 
                         let distance = *x.get_unchecked(i * n + u) - *x.get_unchecked(i * n + v);
                         let distance_squared = distance * distance;
@@ -272,19 +353,24 @@ impl<const DIMS: usize> Context<DIMS> {
                             if sqrtd < 0.000000001 {
                                 needs_displace = true;
                             }
+
+                            // compute condition flags that are used in the inner loop.  We can do it here
+                            // using SIMD and store the flags in memory to be read out later.
+                            //
+                            // The gist of what we're computing is this:
+                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            let weight = *self.G.get_unchecked(u * n + v);
+                            let ideal_distance = *self.D.get_unchecked(u * n + v);
+                            let flag = (sqrtd - ideal_distance) * (weight - 1.) > 0.;
+                            *(self.inner_condition_flags.get_unchecked_mut(u * n + v) as *mut f32
+                                as *mut i32) = if flag { -1i32 } else { 0i32 };
                         }
                     }
                 }
             }
         }
 
-        unsafe {
-            needs_displace
-                || f32x4_extract_lane::<0>(needs_to_apply_displacements) != 0.
-                || f32x4_extract_lane::<1>(needs_to_apply_displacements) != 0.
-                || f32x4_extract_lane::<2>(needs_to_apply_displacements) != 0.
-                || f32x4_extract_lane::<3>(needs_to_apply_displacements) != 0.
-        }
+        unsafe { needs_displace || !i32x4_all_true(all_over_displacement_threshold) }
     }
 
     pub fn compute(&mut self, x: &mut [f32]) {
@@ -307,6 +393,7 @@ impl<const DIMS: usize> Context<DIMS> {
         self.g.fill(0.);
 
         // across all nodes u
+        let mut ix = 0;
         for u in 0..self.n {
             // Hessian diagonal
             let mut Huu: [f32; DIMS] = [0.; DIMS];
@@ -314,44 +401,22 @@ impl<const DIMS: usize> Context<DIMS> {
             // across all nodes v
             for v in 0..self.n {
                 if u == v {
+                    ix += 1;
                     continue;
                 }
 
-                let distance = if cfg!(debug_assertions) {
-                    let val = self.summed_distances[u * n + v];
-                    self.summed_distances[u * n + v] = 0.;
-                    val
-                } else {
-                    unsafe {
-                        let ptr = self.summed_distances.get_unchecked_mut(u * n + v);
-                        let val = *ptr;
-                        *ptr = 0.;
-                        val
-                    }
-                };
-
-                let ideal_distance = if cfg!(debug_assertions) {
-                    self.D[u * n + v]
-                } else {
-                    unsafe { *self.D.get_unchecked(u * n + v) }
-                };
-
-                if cfg!(debug_assertions) {
-                    if ideal_distance == 0. {
-                        panic!("ideal_distance={}; u={}, v={}", ideal_distance, u, v);
-                    }
-                }
-
-                // weights are passed via G matrix.
-                // weight > 1 means not immediately connected
-                // small weights (<<1) are used for group dummy nodes
-                let weight = if cfg!(debug_assertions) {
-                    self.G[u * n + v]
-                } else {
-                    unsafe { *self.G.get_unchecked(u * n + v) }
-                };
-
-                // ignore long range attractions for nodes not immediately connected (P-stress)
+                // The original comment from the JS for what roughly equates to this bit of code:
+                //
+                // "ignore long range attractions for nodes not immediately connected (P-stress)"
+                //
+                // This value is pre-computed in `compute_distances` and corresponds to some somewhat magical
+                // logic that about boils down to:
+                //
+                // (sqrt(summed_distances_squared_per_dimension) - ideal_distance) * (weight - 1.) > 0.
+                //
+                // That in turn replaces this logic:
+                //
+                // (distance > ideal_distance && weight > 1.) || !ideal_distance.is_finite()
                 //
                 // We've done some hacky stuff in the JS wrapper where `ideal_distance` is set to a hugely
                 // negative number and `weight` is set to 1000. if `ideal_distance` is equal to infinity.
@@ -361,13 +426,47 @@ impl<const DIMS: usize> Context<DIMS> {
                 // I don't think it's possible in the current codebase for the buffers where `ideal_distance`
                 // and `weight` come from to be messed with/read after the first run, but if that did happen
                 // it would almost certainly break this code.
-                if distance > ideal_distance && weight > 1. {
+                let flag = unsafe {
+                    *(self.inner_condition_flags.get_unchecked(ix) as *const f32 as *const u32)
+                };
+                // if distance > ideal_distance && weight > 1. {
+                if flag != 0 {
                     for i in 0..DIMS {
                         self.set_H(i, u, v, 0.);
                     }
+                    ix += 1;
                     continue;
                 }
 
+                let distance = if cfg!(debug_assertions) {
+                    let val = self.summed_distances[ix];
+                    self.summed_distances[ix] = 0.;
+                    val
+                } else {
+                    unsafe {
+                        let ptr = self.summed_distances.get_unchecked_mut(ix);
+                        let val = *ptr;
+                        *ptr = 0.;
+                        val
+                    }
+                };
+
+                let ideal_distance = if cfg!(debug_assertions) {
+                    self.D[ix]
+                } else {
+                    unsafe { *self.D.get_unchecked(ix) }
+                };
+
+                if cfg!(debug_assertions) {
+                    if ideal_distance == 0. {
+                        panic!("ideal_distance={}; u={}, v={}", ideal_distance, u, v);
+                    }
+                }
+
+                // \/ This is no longer necesary since we assume `weight` is always 1, see the comment block above
+                //
+                // Comment from the original JS:
+                //
                 // weight > 1 was just an indicator - this is an arcane interface,
                 // but we are trying to be economical storing and passing node pair info
                 // if weight > 1. {
@@ -406,9 +505,9 @@ impl<const DIMS: usize> Context<DIMS> {
 
                 for i in 0..DIMS {
                     let distance = if cfg!(debug_assertions) {
-                        self.distances[(i * n * n) + u * n + v]
+                        self.distances[(i * n * n) + ix]
                     } else {
-                        unsafe { *self.distances.get_unchecked((i * n * n) + u * n + v) }
+                        unsafe { *self.distances.get_unchecked((i * n * n) + ix) }
                     };
 
                     if cfg!(debug_assertions) {
@@ -422,13 +521,15 @@ impl<const DIMS: usize> Context<DIMS> {
                     self.set_H(i, u, v, idk);
                     Huu[i] -= idk;
                 }
+
+                ix += 1;
             }
+
             for i in 0..DIMS {
                 self.set_H(i, u, u, Huu[i]);
                 if Huu[i] > max_h {
                     max_h = Huu[i];
                 }
-                // max_h = max_h.max(Huu[i]);
             }
         }
 
@@ -453,26 +554,46 @@ impl<const DIMS: usize> Context<DIMS> {
     }
 
     #[cfg(not(feature = "simd"))]
-    fn dot_prod(a: *const f32, b: *const f32, count: usize) -> f32 {
+    fn dot_prod(a: *const f32, b: *const f32, count: u64) -> f32 {
         let mut out = 0.;
         for i in 0..count {
-            out += unsafe { *a.add(i) * *b.add(i) };
+            out += unsafe { *a.add(i as usize) * *b.add(i as usize) };
         }
         out
     }
 
     #[cfg(feature = "simd")]
-    fn dot_prod(a: *const f32, b: *const f32, count: usize) -> f32 {
+    fn dot_prod(a: *const f32, b: *const f32, count: u64) -> f32 {
         let mut vector_sum = unsafe { f32x4_splat(0.) };
-        let chunk_count = (count - (count % 4)) / 4;
-        for chunk_ix in 0..chunk_count {
-            let i = chunk_ix * 4;
+        const CHUNK_SIZE: u64 = 4 * 4;
+        let chunk_count = (count - (count % CHUNK_SIZE)) / CHUNK_SIZE;
+
+        let mut i = 0u64;
+        let max_i = chunk_count * CHUNK_SIZE;
+        while i != max_i {
             unsafe {
-                let a_n = v128_load(a.add(i) as *const v128);
-                let b_n = v128_load(b.add(i) as *const v128);
+                let a_n = v128_load(a.add(i as usize) as *const v128);
+                let b_n = v128_load(b.add(i as usize) as *const v128);
+                let multiplied = f32x4_mul(a_n, b_n);
+                vector_sum = f32x4_add(vector_sum, multiplied);
+
+                let a_n = v128_load(a.add(i as usize + 4) as *const v128);
+                let b_n = v128_load(b.add(i as usize + 4) as *const v128);
+                let multiplied = f32x4_mul(a_n, b_n);
+                vector_sum = f32x4_add(vector_sum, multiplied);
+
+                let a_n = v128_load(a.add(i as usize + 8) as *const v128);
+                let b_n = v128_load(b.add(i as usize + 8) as *const v128);
+                let multiplied = f32x4_mul(a_n, b_n);
+                vector_sum = f32x4_add(vector_sum, multiplied);
+
+                let a_n = v128_load(a.add(i as usize + 12) as *const v128);
+                let b_n = v128_load(b.add(i as usize + 12) as *const v128);
                 let multiplied = f32x4_mul(a_n, b_n);
                 vector_sum = f32x4_add(vector_sum, multiplied);
             }
+
+            i += CHUNK_SIZE;
         }
 
         let mut sum = unsafe {
@@ -483,23 +604,24 @@ impl<const DIMS: usize> Context<DIMS> {
         };
 
         // Remainder
-        for i in (chunk_count * 4)..count {
-            sum += unsafe { *a.add(i) * *b.add(i) };
+        for i in max_i..(count as u64) {
+            sum += unsafe { *a.add(i as usize) * *b.add(i as usize) };
         }
 
         sum
     }
 
     /// result r = matrix m * vector v
+    // #[inline(never)]
     fn right_multiply<'a>(
         m: *const f32,
         m_chunk_count: usize,
-        m_chunk_size: usize,
+        m_chunk_size: u64,
         v: *const f32,
         r: &mut [f32],
     ) {
         for i in 0..m_chunk_count {
-            let mn = unsafe { m.add(i * m_chunk_size) };
+            let mn = unsafe { m.add(i * m_chunk_size as usize) };
             if cfg!(debug_assertions) {
                 r[i] = Self::dot_prod(mn, v, m_chunk_size);
             } else {
@@ -517,16 +639,18 @@ impl<const DIMS: usize> Context<DIMS> {
         let mut denominator = 0.;
         let H_dim_size = self.n * self.n;
         let n = self.n;
+        let n_u64 = self.n as u64;
 
         for i in 0..DIMS {
             let gn = unsafe { self.g.as_ptr().add(i * n) };
 
-            numerator += Self::dot_prod(gn, gn, n);
+            numerator += Self::dot_prod(gn, gn, n_u64);
             let Hd_i = if cfg!(debug_assertions) {
                 &mut self.Hd[i]
             } else {
                 unsafe { self.Hd.get_unchecked_mut(i) }
             };
+
             Self::right_multiply(
                 if cfg!(debug_assertions) {
                     &self.H[(i * H_dim_size)..(i * H_dim_size + H_dim_size)]
@@ -538,11 +662,12 @@ impl<const DIMS: usize> Context<DIMS> {
                 }
                 .as_ptr(),
                 n,
-                n,
+                n_u64,
                 gn,
                 Hd_i,
             );
-            denominator += Self::dot_prod(gn, Hd_i.as_ptr(), n);
+
+            denominator += Self::dot_prod(gn, Hd_i.as_ptr(), n_u64);
         }
 
         if denominator == 0. || !denominator.is_finite() {
