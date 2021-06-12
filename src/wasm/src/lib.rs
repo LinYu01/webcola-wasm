@@ -210,10 +210,10 @@ impl<const DIMS: usize> Context<DIMS> {
                             // using SIMD and store the flags in memory to be read out later.
                             //
                             // The gist of what we're computing is this:
-                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            // (sqrted > ideal_distance) && (weight > 1.)
                             let weight = *self.G.get_unchecked(ix);
                             let ideal_distance = *self.D.get_unchecked(ix);
-                            let flag = (sqrtd - ideal_distance) * (weight - 1.) > 0.;
+                            let flag = (sqrtd > ideal_distance) && (weight > 1.);
                             *(self.inner_condition_flags.get_unchecked_mut(ix) as *mut f32
                                 as *mut i32) = if flag { -1i32 } else { 0i32 };
                         }
@@ -285,7 +285,7 @@ impl<const DIMS: usize> Context<DIMS> {
                             // using SIMD and store the flags in memory to be read out later.
                             //
                             // The gist of what we're computing is this:
-                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            // (sqrted > ideal_distance) && (weight > 1.)
                             let ideal_distances_v = v128_load(
                                 self.D.get_unchecked(u * n + v_chunk_ix * 4) as *const f32
                                     as *const _,
@@ -294,12 +294,9 @@ impl<const DIMS: usize> Context<DIMS> {
                                 as *const f32
                                 as *const _);
 
-                            let flags = f32x4_gt(
-                                f32x4_mul(
-                                    f32x4_sub(sqrted, ideal_distances_v),
-                                    f32x4_sub(weights_v, f32x4_splat(1.)),
-                                ),
-                                f32x4_splat(0.),
+                            let flags = v128_and(
+                                f32x4_gt(sqrted, ideal_distances_v),
+                                f32x4_gt(weights_v, f32x4_splat(1.)),
                             );
                             v128_store(
                                 self.inner_condition_flags
@@ -358,10 +355,10 @@ impl<const DIMS: usize> Context<DIMS> {
                             // using SIMD and store the flags in memory to be read out later.
                             //
                             // The gist of what we're computing is this:
-                            // (sqrted - ideal_distance) * (weight - 1.) > 0.
+                            // (sqrted > ideal_distance) && (weight > 1.)
                             let weight = *self.G.get_unchecked(u * n + v);
                             let ideal_distance = *self.D.get_unchecked(u * n + v);
-                            let flag = (sqrtd - ideal_distance) * (weight - 1.) > 0.;
+                            let flag = (sqrtd > ideal_distance) && (weight > 1.);
                             *(self.inner_condition_flags.get_unchecked_mut(u * n + v) as *mut f32
                                 as *mut i32) = if flag { -1i32 } else { 0i32 };
                         }
@@ -409,10 +406,10 @@ impl<const DIMS: usize> Context<DIMS> {
                 //
                 // "ignore long range attractions for nodes not immediately connected (P-stress)"
                 //
-                // This value is pre-computed in `compute_distances` and corresponds to some somewhat magical
-                // logic that about boils down to:
+                // This value is pre-computed in `compute_distances` and corresponds to some logic that
+                // boils down to:
                 //
-                // (sqrt(summed_distances_squared_per_dimension) - ideal_distance) * (weight - 1.) > 0.
+                // (sqrt(summed_distances_squared_per_dimension) > ideal_distance) && (weight > 1.)
                 //
                 // That in turn replaces this logic:
                 //

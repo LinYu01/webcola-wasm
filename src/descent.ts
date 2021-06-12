@@ -207,8 +207,8 @@ DEBUG */
 
             allD.forEach((d, i) => {
                 if (d === Infinity) {
-                    allD[i] = -10000000;
-                    allG[i] = 1000.;
+                    allD[i] = -10000000; // ideal distance
+                    allG[i] = 1000.; // weight
                 }
             });
 
