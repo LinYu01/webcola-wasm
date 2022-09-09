@@ -1,4 +1,4 @@
-#![feature(box_syntax, core_intrinsics, wasm_simd)]
+#![feature(box_syntax, core_intrinsics)]
 #![allow(non_snake_case)]
 
 use rand::prelude::*;
