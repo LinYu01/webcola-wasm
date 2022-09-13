@@ -13,3 +13,7 @@ src/**/*.map
 test/**/*.js
 test/**/*.map
 /tmp
+src/wasm/build/simd/derivative_computer_bg.wasm.d.ts
+src/wasm/build/simd/derivative_computer.d.ts
+src/wasm/build/no_simd/derivative_computer_bg.wasm.d.ts
+src/wasm/build/no_simd/derivative_computer.d.ts
