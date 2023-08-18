@@ -33,7 +33,9 @@
   "sideEffects": false,
   "scripts": {
     "watch": "tsdx watch --noClean --name cola --format esm,umd",
-    "build": "cd src/wasm && just build-all && cd - && tsdx build --name cola --format esm,umd",
+    "build:wasm": "cd src/wasm && just build-all && cd -",
+    "build:js": "tsdx build --name cola --format esm,umd",
+    "build":"npm run build:wasm && npm run build:js",
     "postbuild": "npm run typings",
     "typings": "tsc -p tsconfig.dts.json && rollup -c rollup.dts.config.js",
     "test": "tsdx test --passWithNoTests",

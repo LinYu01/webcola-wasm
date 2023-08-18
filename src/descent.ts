@@ -58,6 +58,13 @@ DEBUG */
     export class Descent {
         private wasm: DerivativeComputerWasmInst;
         private ctxPtr: number;
+        private ptr0: number;
+        private size0: number;
+        private ptr1: number;
+        private size1: number;
+
+        private ptr2: number;
+        private size2: number;
 
         public threshold: number = 0.0001;
         /** gradient vector
@@ -85,9 +92,13 @@ DEBUG */
             })();
 
             if (this.k === 2) {
-                this.wasm.set_G_2d(this.ctxPtr, allG);
+                // @ts-ignore
+                this.ptr2 = this.wasm.set_G_2d(this.ctxPtr, allG);
+                this.size2 = allG.length * 4;
             } else if (this.k === 3) {
-                this.wasm.set_G_3d(this.ctxPtr, allG);
+                // @ts-ignore
+                this.ptr2 = this.wasm.set_G_3d(this.ctxPtr, allG);
+                this.size2 = allG.length * 4;
             } else {
                 throw new Error('Invalid dimensionality');
             }
@@ -193,6 +204,15 @@ DEBUG */
 
         public project: { (x0: Float32Array, y0: Float32Array, r: Float32Array): void }[] = null;
 
+        public cleanWasmMemory() {
+            // @ts-ignore
+            this.wasm.getWasm().__wbindgen_free(this.ptr0, this.size0);
+            // @ts-ignore
+            this.wasm.getWasm().__wbindgen_free(this.ptr1, this.size1);
+            // @ts-ignore
+            this.wasm.getWasm().__wbindgen_free(this.ptr2, this.size2);
+        }
+
         private setupWasm(D: number[][], G: number[][] | null = null) {
             const allD = new Float32Array(this.n * this.n);
             const allG = G ? new Float32Array(this.n * this.k) : new Float32Array(0);
@@ -213,7 +233,13 @@ DEBUG */
             });
 
             const createrFn = this.k === 2 ? this.wasm.create_derivative_computer_ctx_2d : this.wasm.create_derivative_computer_ctx_3d;
-            this.ctxPtr = createrFn(this.n, allD, allG);
+            const arr = createrFn(this.n, allD, allG) as any as [number, number, number];;
+            const [ctxPtr, ptr0, ptr1] = arr;
+            this.ctxPtr = ctxPtr;
+            this.ptr0 = ptr0;
+            this.ptr1 = ptr1;
+            this.size0 = allD.length * 4;
+            this.size1 = allG.length * 4;
         }
 
         /**

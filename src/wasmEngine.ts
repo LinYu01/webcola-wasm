@@ -38,7 +38,7 @@ class AsyncOnce<T> {
   }
 }
 
-const WasmInst = new AsyncOnce(async () => {
+export const WasmInst = new AsyncOnce(async () => {
   const hasWasmSIMDSupport = await getHasSIMDSupport();
   if (!window.location.href.includes('localhost')) {
     console.log(

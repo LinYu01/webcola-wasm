@@ -718,7 +718,14 @@ const wasmInstPromise = getDerivativeComputerWasm();
             return this.alpha(0.1);
         }
 
+        pause(): this {
+            return this.alpha(0);
+        }
+
         stop(): this {
+            if (this._descent) {
+                this._descent.cleanWasmMemory();
+            }
             return this.alpha(0);
         }
 
