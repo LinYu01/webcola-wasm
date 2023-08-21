@@ -675,6 +675,14 @@ impl<const DIMS: usize> Context<DIMS> {
 }
 
 #[wasm_bindgen]
+pub fn release_ctx_2d(ctx_ptr: *mut Context<2>){
+    let ctx: &mut Context<2> = unsafe { &mut *ctx_ptr };
+    unsafe {
+        drop(Box::from_raw(ctx as *mut _));
+    }
+}
+
+#[wasm_bindgen]
 pub fn create_derivative_computer_ctx_2d(
     node_count: usize,
     D: Vec<f32>,

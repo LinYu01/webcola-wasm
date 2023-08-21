@@ -57,14 +57,8 @@ DEBUG */
      */
     export class Descent {
         private wasm: DerivativeComputerWasmInst;
-        private ctxPtr: number;
-        private ptr0: number;
-        private size0: number;
-        private ptr1: number;
-        private size1: number;
 
-        private ptr2: number;
-        private size2: number;
+        private ctxPtr: number;
 
         public threshold: number = 0.0001;
         /** gradient vector
@@ -92,13 +86,9 @@ DEBUG */
             })();
 
             if (this.k === 2) {
-                // @ts-ignore
-                this.ptr2 = this.wasm.set_G_2d(this.ctxPtr, allG);
-                this.size2 = allG.length * 4;
+                this.wasm.set_G_2d(this.ctxPtr, allG);
             } else if (this.k === 3) {
-                // @ts-ignore
-                this.ptr2 = this.wasm.set_G_3d(this.ctxPtr, allG);
-                this.size2 = allG.length * 4;
+                this.wasm.set_G_3d(this.ctxPtr, allG);
             } else {
                 throw new Error('Invalid dimensionality');
             }
@@ -205,12 +195,7 @@ DEBUG */
         public project: { (x0: Float32Array, y0: Float32Array, r: Float32Array): void }[] = null;
 
         public cleanWasmMemory() {
-            // @ts-ignore
-            this.wasm.getWasm().__wbindgen_free(this.ptr0, this.size0);
-            // @ts-ignore
-            this.wasm.getWasm().__wbindgen_free(this.ptr1, this.size1);
-            // @ts-ignore
-            this.wasm.getWasm().__wbindgen_free(this.ptr2, this.size2);
+            this.wasm.release_ctx_2d(this.ctxPtr);
         }
 
         private setupWasm(D: number[][], G: number[][] | null = null) {
@@ -233,13 +218,8 @@ DEBUG */
             });
 
             const createrFn = this.k === 2 ? this.wasm.create_derivative_computer_ctx_2d : this.wasm.create_derivative_computer_ctx_3d;
-            const arr = createrFn(this.n, allD, allG) as any as [number, number, number];;
-            const [ctxPtr, ptr0, ptr1] = arr;
+            const ctxPtr = createrFn(this.n, allD, allG);
             this.ctxPtr = ctxPtr;
-            this.ptr0 = ptr0;
-            this.ptr1 = ptr1;
-            this.size0 = allD.length * 4;
-            this.size1 = allG.length * 4;
         }
 
         /**
