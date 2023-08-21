@@ -871,10 +871,7 @@
     };
 
     _proto2.cleanWasmMemory = function cleanWasmMemory() {
-      if (this.ctxPtr) {
-        this.wasm.release_ctx_2d(this.ctxPtr);
-        this.ctxPtr = 0;
-      }
+      this.wasm.release_ctx_2d(this.ctxPtr);
     };
 
     _proto2.setupWasm = function setupWasm(D, G) {

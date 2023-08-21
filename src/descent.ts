@@ -195,10 +195,7 @@ DEBUG */
         public project: { (x0: Float32Array, y0: Float32Array, r: Float32Array): void }[] = null;
 
         public cleanWasmMemory() {
-            if (this.ctxPtr) {
-                this.wasm.release_ctx_2d(this.ctxPtr); 
-                this.ctxPtr = 0;
-            }
+            this.wasm.release_ctx_2d(this.ctxPtr);
         }
 
         private setupWasm(D: number[][], G: number[][] | null = null) {
