@@ -865,7 +865,10 @@ var Descent = /*#__PURE__*/function () {
   };
 
   _proto2.cleanWasmMemory = function cleanWasmMemory() {
-    this.wasm.release_ctx_2d(this.ctxPtr);
+    if (this.ctxPtr) {
+      this.wasm.release_ctx_2d(this.ctxPtr);
+      this.ctxPtr = 0;
+    }
   };
 
   _proto2.setupWasm = function setupWasm(D, G) {
